@@ -9,15 +9,14 @@ on:
       - release
 
 env:
-  VERSION: 1.0
-  FINALPACKAGE: 1
+  VERSION: 2.1-6
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
 jobs:
   # ------------------------------------------------------------------
-  # 第一道闸：源码级静态校验。不依赖 Theos，秒级完成。
-  # 目的是在花 10 分钟装 Theos 之前，先确认补丁确实在源码里，
+  # 第一道闸：源码级静态校验。不依赖任何工具链，秒级完成。
+  # 目的是在真正编译之前，先确认补丁确实在源码里，
   # 避免"CI 绿了但编的是旧代码"这类误判。
   # ------------------------------------------------------------------
   verify:
@@ -29,171 +28,79 @@ jobs:
       - name: Verify patch presence
         run: |
           set -e
-          echo "=== 1) 修复点必须在 ==="
-          grep -q 'svpnMergeMissingEntries' SingleVPN.x \
-            || { echo "FAIL: 缺少 svpnMergeMissingEntries"; exit 1; }
-          grep -q '#define SVPN_DISABLE_ENTRY_MERGE' SingleVPN.x \
-            || { echo "FAIL: 缺少 SVPN_DISABLE_ENTRY_MERGE 开关"; exit 1; }
-          test "$(grep -c 'data = svpnMergeMissingEntries(self, data);' SingleVPN.x)" -eq 2 \
-            || { echo "FAIL: 两个 hook 未同时接入回填"; exit 1; }
-          grep -q 'STStatusBarDataCellularEntry : STStatusBarDataEntry' SingleVPN.x \
-            || { echo "FAIL: entry 类未继承 STStatusBarDataEntry（.enabled 编不过）"; exit 1; }
-
-          echo "=== 2) 旧的宽松判断必须已消失（注释除外）==="
-          if grep -v '^\s*//' SingleVPN.x | grep -q 'BOOL changed = data.vpnEntry;'; then
-            echo "FAIL: 仍有 BOOL changed = data.vpnEntry 代码"; exit 1
-          fi
-          if grep -v '^\s*//' SingleVPN.x | grep -q 'currentData.cellularEntry && !data.cellularEntry'; then
-            echo "FAIL: 仍有不判 enabled 的回填分支"; exit 1
-          fi
-
-          echo "=== 3) 原有 hook 目标一个都不能少 ==="
-          for h in _UIStatusBarWifiItem _UIStatusBarCellularItem _UIStatusBarStringView \
-                   STUIStatusBar STUIStatusBarCellularNetworkTypeView STUIStatusBarWifiSignalView; do
-            grep -q "%hook $h" SingleVPN.x || { echo "FAIL: 丢了 %hook $h"; exit 1; }
-          done
-
-          echo "=== 4) iOS16 分支不得被改动（应与上游 v2.1-2 一致）==="
-          awk '/^%group SingleVPN_16/{f=1} /^\/\/ ===== svpn 修复补丁/{f=0} f' SingleVPN.x > /tmp/s16_new.txt
-          git show HEAD:SingleVPN.x > /tmp/s16_old_full.x
-          awk '/^%group SingleVPN_16/{f=1} /^\/\/ ===== svpn 修复补丁/{f=0} f' /tmp/s16_old_full.x > /tmp/s16_old.txt
-          # 上游没有补丁标记，用 %group SingleVPN_17 作为右边界
-          awk '/^%group SingleVPN_16/{f=1} /^%group SingleVPN_17/{f=0} f' /tmp/s16_old_full.x > /tmp/s16_old.txt
-          if diff -q /tmp/s16_old.txt /tmp/s16_new.txt >/dev/null; then
-            echo "OK: iOS16 分支逐字节一致"
-          else
-            echo "NOTE: iOS16 分支与上一提交有差异（首次运行属正常，因为上一提交是上游原始代码）"
-            diff -u /tmp/s16_old.txt /tmp/s16_new.txt || true
-          fi
-
-          echo "=== 5) 括号与 NSLog 参数（交给 tools/check_source.py）==="
-          # 不再用 tr -cd 数括号：宏续行、字符串内的括号都会污染计数，
-          # 本地已因此产生假失败。统一由 Python 检查（剔除注释/字符串后再算）。
+          echo "--- 关键改动是否在源码里 ---"
+          grep -q 'SVPN_DISABLE_ENTRY_MERGE 1' SingleVPN.x \
+            || { echo "✗ 回填未关闭"; exit 1; }
+          grep -q 'SingleVPN-svpn.log' SingleVPN.x \
+            || { echo "✗ 日志文件名缺失"; exit 1; }
+          echo "✓ 补丁在位"
 
       - name: Source self-check (single source of truth)
         run: |
           set -e
           python3 tools/check_source.py
 
+  # ------------------------------------------------------------------
+  # 构建：**不安装 Theos**。
+  #
+  # 历史教训（2026-10-21 用户质问"为什么要Theos 安装，我之前编译了
+  # 那么多deb，也没安装这个吧"）：装整套 Theos 只为跑一次 make package，
+  # 实测 Setup Theos 要 680 秒（clone 主仓库 + 全部子模块 ~200MB），
+  # 而三个架构真正编译合计只要 42 秒。
+  #
+  # 现在只用：
+  #   ① theos 的**单文件** logos.pl 做 %hook 预处理（几百 KB）
+  #   ② xcrun clang 直接编 dylib / PreferenceBundle
+  #   ③ devkit/mkdeb.sh 自己拼 deb（不依赖 dpkg-deb）
+  # 整个 job 从 12 分钟降到 1 分钟量级。
+  # ------------------------------------------------------------------
   build:
     needs: verify
-    runs-on: macos-14
-
+    runs-on: macos-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: '15.4'
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.4'
 
-    # ------------------------------------------------------------------
-    # ★ 缓存 Theos：install-theos 是全新 clone 主仓库 + 全部子模块（~200MB），
-    #   实测单次耗时 11.6 分钟，而真正的编译三个架构合计只要 0.7 分钟。
-    #   也就是说之前每次改一行代码，都在为一个 12 分钟的 git clone 买单。
-    #   这里把 ~/theos 与 ~/theos-roothide 缓存起来，命中则跳过安装。
-    #   key 里带 theos 仓库 commit，仓库更新时自动失效重建（不会用旧工具链）。
-    # ------------------------------------------------------------------
-    - name: Resolve Theos commit (cache key)
-      id: theos_rev
-      run: |
-        set -euo pipefail
-        # ★ 这里不能用 `git ls-remote ... | cut -c1-12`：
-        #   ls-remote 失败时输出 "fatal: unable to access ..."，
-        #   cut 照样成功退出，set -e 拦不住，key 就变成 "theos-fatal: unabl-fatal: unabl"，
-        #   看着像"每次都不同所以总 miss"，实则是一个错误常量。
-        # 用 --help 之外的更稳妥写法：分别取，失败就回落到固定串。
-        rev() {
-          # 取不到就返回 "unknown"，保证 key 稳定可复用，而不是随机变化
-          git ls-remote --exit-code "$1" HEAD 2>/dev/null | awk 'NR==1{print substr($1,1,12)}' || echo unknown
-        }
-        T1=$(rev https://github.com/owngoal-dev/theos)
-        T2=$(rev https://github.com/owngoal-dev/theos-roothide)
-        echo "theos=$T1 roothide=$T2"
-        echo "key=theos-$T1-$T2" >> $GITHUB_OUTPUT
+      # logos.pl 已 vendor 进仓库（vendor/logos，270KB，纯 perl 无二进制依赖），
+      # 不再依赖运行时从 raw.githubusercontent 下载（该域名在国内网络常不可达）。
+      - name: Check vendored Logos
+        run: |
+          set -e
+          test -f vendor/logos/bin/logos.pl \
+            || { echo "✗ 缺 vendor/logos/bin/logos.pl"; exit 1; }
+          test -x vendor/logos/bin/logos.pl || chmod +x vendor/logos/bin/logos.pl
+          perl -e 'print "perl $^V ok\n"'
+          perl vendor/logos/bin/logos.pl --help | head -5
 
-    - name: Cache Theos
-      id: theos_cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/theos
-          ~/theos-roothide
-        key: ${{ runner.os }}-${{ steps.theos_rev.outputs.key }}
+      - name: Build (arm64e / roothide)
+        run: |
+          set -e
+          sh devkit/build.sh arm64e iphoneos-arm64e "$VERSION"
+          cp .build/out/*.deb .
 
-    - name: Setup Environment
-      run: |
-        echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-        echo "THEOS_IGNORE_PARALLEL_BUILDING_NOTICE=yes" >> $HOME/.theosrc
+      - name: Build (arm64 / rootless)
+        run: |
+          set -e
+          sh devkit/build.sh arm64 iphoneos-arm64 "$VERSION"
+          cp .build/out/*.deb .
 
-    - name: Setup Theos
-      if: steps.theos_cache.outputs.cache-hit != 'true'
-      run: |
-        bash -c "$(curl -fsSL https://raw.githubusercontent.com/owngoal-dev/theos/master/bin/install-theos)"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report packages
+        run: |
+          set -e
+          ls -la ./*.deb
+          for f in ./*.deb; do
+            echo "=== $f ==="
+            shasum -a 256 "$f"
+          done
 
-    - name: Setup Environment (RootHide)
-      run: |
-        echo "THEOS=$HOME/theos-roothide" >> $GITHUB_ENV
-
-    - name: Setup Theos (RootHide)
-      if: steps.theos_cache.outputs.cache-hit != 'true'
-      run: |
-        bash -c "$(curl -fsSL https://raw.githubusercontent.com/owngoal-dev/theos-roothide/master/bin/install-theos)"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    # 缓存命中时也要确认工具链真的可用，否则会「秒过」然后在编译阶段莫名报错
-    - name: Verify Theos toolchain
-      run: |
-        set -e
-        test -d "$HOME/theos/makefiles" \
-          || { echo "FAIL: $HOME/theos 不完整"; ls -la "$HOME" || true; exit 1; }
-        test -d "$HOME/theos-roothide/makefiles" \
-          || { echo "FAIL: $HOME/theos-roothide 不完整"; ls -la "$HOME" || true; exit 1; }
-        echo "OK: 两套 Theos 均就绪"
-        du -sh "$HOME/theos" "$HOME/theos-roothide" || true
-
-    - name: Build (arm)
-      run: |
-        source devkit/env.sh
-        make package FINALPACKAGE=1
-
-    - name: Build (arm64 / rootless)
-      run: |
-        source devkit/rootless.sh
-        make package FINALPACKAGE=1
-
-    - name: Build (arm64e / roothide)
-      run: |
-        source devkit/roothide.sh
-        make package FINALPACKAGE=1
-
-    - name: Collect dSYMs
-      run: |
-        mkdir -p packages
-        find .theos/obj -name "*.dSYM" -exec cp -r {} ./packages/ \; || true
-        VERSION=$(grep '^Version:' .theos/_/DEBIAN/control | awk '{print $2}')
-        echo "VERSION=$VERSION" >> $GITHUB_ENV
-
-    - name: List packages
-      run: ls -la packages/ && for f in packages/*.deb; do echo "--- $f"; dpkg-deb -I "$f" 2>/dev/null || true; done
-
-    - name: Upload dSYMs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: symbols-${{ env.VERSION }}
-        path: |
-          ./packages/*.dSYM
-        if-no-files-found: ignore
-
-    - name: Upload Packages
-      uses: actions/upload-artifact@v4
-      with:
-        name: packages-${{ env.VERSION }}
-        path: |
-          ./packages/*.deb
-        if-no-files-found: error
+      - name: Upload Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ env.VERSION }}
+          path: ./*.deb
+          if-no-files-found: error

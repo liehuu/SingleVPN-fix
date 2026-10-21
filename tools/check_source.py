@@ -384,13 +384,13 @@ for _root, _dirs, _fs in os.walk(_REPO):
     if '.git' in _root or '.theos' in _root or 'packages' in _root:
         continue
     for _f in _fs:
-        if not _f.endswith('.sh'):
+        if not _f.endswith(('.sh', '.pl', '.pm')):
             continue
         _p = os.path.join(_root, _f)
         _b = open(_p, 'rb').read()
         if b'\r\n' in _b:
             _bad_eol.append(os.path.relpath(_p, _REPO))
-chk("所有 .sh 均为 LF 行尾", not _bad_eol,
+chk("所有 .sh/.pl/.pm 均为 LF 行尾", not _bad_eol,
     ("CRLF: " + ", ".join(_bad_eol)) if _bad_eol else "全部 LF")
 
 print("\n[A14] 脚本可执行位（644 在 runner 上 permission denied）")
@@ -416,6 +416,32 @@ if os.path.isdir(_git_dir):
 chk("索引中所有 .sh 均为 100755", not _mode_bad,
     ("权限不对: " + ", ".join(_mode_bad)) if _mode_bad
     else "全部 100755（修法：git update-index --chmod=+x <file>）")
+
+print("\n[A15] CI 不得再安装整套 Theos（用户明确质疑过）")
+# 2026-10-21 用户原话：「为什么要Theos 安装，我之前编译了那么多deb，
+# 也没安装这个吧」。实测 Setup Theos 要 680 秒（clone 主仓库+全部子模块
+# ~200MB），而三个架构真正编译合计只要 42 秒 —— 90% 时间花在无谓的 clone 上。
+# 现在改为：单文件 logos.pl 预处理 + xcrun clang 直编 + devkit/mkdeb.sh 拼 deb。
+_wf = os.path.join(_REPO, '.github', 'workflows', 'build.yml')
+_wf_ok = os.path.isfile(_wf)
+_wf_txt = open(_wf, encoding='utf-8').read() if _wf_ok else ''
+chk("workflow 文件存在", _wf_ok, _wf)
+if _wf_ok:
+    # 反向断言：工作流里不应再出现 install-theos / 整目录缓存 theos
+    chk("未再调用 install-theos", 'install-theos' not in _wf_txt,
+        "" if 'install-theos' not in _wf_txt else "仍在装整套 Theos")
+    # 必须以模块方式使用 logos.pl 与 build.sh
+    chk("logos.pl 已 vendor 进仓库（不靠运行时下载）",
+        os.path.isfile(os.path.join(_REPO, 'vendor', 'logos', 'bin', 'logos.pl')))
+    # raw.githubusercontent.com 在国内网络常不可达，构建不得依赖它
+    chk("构建不依赖 raw.githubusercontent 下载",
+        'raw.githubusercontent.com' not in _wf_txt,
+        "" if 'raw.githubusercontent.com' not in _wf_txt else "仍在运行时下载")
+    chk("使用 devkit/build.sh 构建", 'devkit/build.sh' in _wf_txt)
+    chk("打包走 devkit/mkdeb.sh（不依赖 dpkg-deb）",
+        os.path.isfile(os.path.join(_REPO, 'devkit', 'mkdeb.sh')))
+    # 两个架构都要出包
+    chk("覆盖 arm64e 与 arm64", 'arm64e' in _wf_txt and 'arm64' in _wf_txt)
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
