@@ -11,6 +11,11 @@
   A6 %hook 数量与目标
   A7 修复点仍在（回填守卫 / A-B 宏）
   A8 诊断开关与使用一致
+  A9~A12 桥接/全局变量/日志通道等细节
+  A13 脚本行尾必须是 LF（CRLF 在 runner 上 command not found）
+  A14 脚本在 git 索引里必须是 100755
+  A15 CI 不得再安装整套 Theos（零 Theos 构建）
+  A16 shell 里 $VAR 后不得紧跟中文/全角字符（会被算进变量名）
 
 参数：可传 --no-cross 跳过跨行 NSLog 检查（调试用）
 """
@@ -442,6 +447,31 @@ if _wf_ok:
         os.path.isfile(os.path.join(_REPO, 'devkit', 'mkdeb.sh')))
     # 两个架构都要出包
     chk("覆盖 arm64e 与 arm64", 'arm64e' in _wf_txt and 'arm64' in _wf_txt)
+
+print("\n[A16] shell 里 $VAR 不得紧跟中文/全角字符")
+# 真实踩过（CI 实测 devkit/build.sh line 125）：
+#   echo "✓ 架构校验通过（$CPU）"
+#   报 `CPU）: unbound variable`，set -eu 直接退出，整步失败。
+# 根因：bash 的变量名边界只认 ASCII 字母/数字/下划线，但它并不把多字节
+#   UTF-8 字符当「非标识符」，而是把这些字节一并算进名字里 → 变量名变成
+#   `CPU）`。本项目注释与提示语大量用中文，这类位置极易随手写出。
+# 修法：一律写 ${CPU}。此检查专抓「$name 后紧跟非 ASCII 字节」。
+import re as _re
+_var_bad = []
+for _root, _dirs, _fs in os.walk(os.path.join(_REPO, 'devkit')):
+    for _f in _fs:
+        if not _f.endswith('.sh'):
+            continue
+        _p = os.path.join(_root, _f)
+        for _ln, _line in enumerate(open(_p, encoding='utf-8', errors='replace'), 1):
+            if _line.lstrip().startswith('#'):
+                continue          # 纯注释行不执行，放过（与 A11/A15 同类处理）
+            # $NAME 后面紧跟一个非 ASCII 字节
+            for _m in _re.finditer(r'\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7f])', _line):
+                _var_bad.append("%s:%d $%s 后紧跟 %r"
+                                % (os.path.relpath(_p, _REPO), _ln, _m.group(1), _m.group(2)))
+chk("devkit/*.sh 无 $VAR 紧邻全角字符", not _var_bad,
+    ("; ".join(_var_bad)) if _var_bad else "全部使用 ${VAR} 或 ASCII 边界")
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

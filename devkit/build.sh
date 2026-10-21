@@ -122,7 +122,12 @@ xcrun lipo -info "$BUILD/SingleVPN.dylib" | grep -q "$CPU" \
   || { echo "✗ dylib 缺 $CPU 切片"; exit 1; }
 xcrun lipo -info "$BUILD/SingleVPNPrefs" | grep -q "$CPU" \
   || { echo "✗ Prefs 缺 $CPU 切片"; exit 1; }
-echo "✓ 架构校验通过（$CPU）"
+# ★ 变量后面紧跟中文/全角字符（如 `）`）时，必须写成 ${CPU}：
+#   bash 的变量名边界只认 ASCII 字母数字下划线，但它对多字节 UTF-8 的
+#   处理是「把这些字节也算进名字」，于是 `$CPU）` 被解析成变量 `CPU）`，
+#   set -u 下直接 `CPU）: unbound variable`（CI 实测 line 125）。
+#   本项目注释里中文很多，这类位置一律加花括号。
+echo "✓ 架构校验通过（${CPU}）"
 
 # ---------- 6) 功能指纹闸门 ----------
 # 这些字符串/选择子任何一条丢了，产物表面看不出来，但装到机器上就是功能缺失。
@@ -136,7 +141,7 @@ echo "✓ dylib hook 入口齐全"
 
 for sym in loadSpecifiersFromPlistName _specifiers; do
   grep -aq "$sym" "$BUILD/SingleVPNPrefs" \
-    || { echo "✗ Prefs 缺 $sym（设置界面会空白/重载崩溃）"; exit 1; }
+    || { echo "✗ Prefs 缺 ${sym}（设置界面会空白/重载崩溃）"; exit 1; }
 done
 echo "✓ Prefs specifiers 加载路径齐全"
 
