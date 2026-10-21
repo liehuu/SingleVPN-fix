@@ -88,12 +88,38 @@ jobs:
       with:
         xcode-version: '15.4'
 
+    # ------------------------------------------------------------------
+    # ★ 缓存 Theos：install-theos 是全新 clone 主仓库 + 全部子模块（~200MB），
+    #   实测单次耗时 11.6 分钟，而真正的编译三个架构合计只要 0.7 分钟。
+    #   也就是说之前每次改一行代码，都在为一个 12 分钟的 git clone 买单。
+    #   这里把 ~/theos 与 ~/theos-roothide 缓存起来，命中则跳过安装。
+    #   key 里带 theos 仓库 commit，仓库更新时自动失效重建（不会用旧工具链）。
+    # ------------------------------------------------------------------
+    - name: Resolve Theos commit (cache key)
+      id: theos_rev
+      run: |
+        set -e
+        T1=$(git ls-remote https://github.com/owngoal-dev/theos HEAD | cut -c1-12)
+        T2=$(git ls-remote https://github.com/owngoal-dev/theos-roothide HEAD | cut -c1-12)
+        echo "theos=$T1 roothide=$T2"
+        echo "key=theos-$T1-$T2" >> $GITHUB_OUTPUT
+
+    - name: Cache Theos
+      id: theos_cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/theos
+          ~/theos-roothide
+        key: ${{ runner.os }}-${{ steps.theos_rev.outputs.key }}
+
     - name: Setup Environment
       run: |
         echo "THEOS=$HOME/theos" >> $GITHUB_ENV
         echo "THEOS_IGNORE_PARALLEL_BUILDING_NOTICE=yes" >> $HOME/.theosrc
 
     - name: Setup Theos
+      if: steps.theos_cache.outputs.cache-hit != 'true'
       run: |
         bash -c "$(curl -fsSL https://raw.githubusercontent.com/owngoal-dev/theos/master/bin/install-theos)"
       env:
@@ -104,10 +130,22 @@ jobs:
         echo "THEOS=$HOME/theos-roothide" >> $GITHUB_ENV
 
     - name: Setup Theos (RootHide)
+      if: steps.theos_cache.outputs.cache-hit != 'true'
       run: |
         bash -c "$(curl -fsSL https://raw.githubusercontent.com/owngoal-dev/theos-roothide/master/bin/install-theos)"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # 缓存命中时也要确认工具链真的可用，否则会「秒过」然后在编译阶段莫名报错
+    - name: Verify Theos toolchain
+      run: |
+        set -e
+        test -d "$HOME/theos/makefiles" \
+          || { echo "FAIL: $HOME/theos 不完整"; ls -la "$HOME" || true; exit 1; }
+        test -d "$HOME/theos-roothide/makefiles" \
+          || { echo "FAIL: $HOME/theos-roothide 不完整"; ls -la "$HOME" || true; exit 1; }
+        echo "OK: 两套 Theos 均就绪"
+        du -sh "$HOME/theos" "$HOME/theos-roothide" || true
 
     - name: Build (arm)
       run: |
