@@ -249,6 +249,11 @@ static NSUInteger gDiagSeq = 0;
 /// 颜色染色采样计数（单独计数，避免被数据异常记录挤满）
 static NSUInteger gColorDiagCount = 0;
 
+/// 上一份被记录过的 data 指针。_updateWithAggregatedData: 每帧都走，
+/// 同一次渲染可能连着调好几次；同一份数据的对象地址相同就跳过，
+/// 避免重复拼字符串（热路径开销的主要来源）。
+static const void *gLastLoggedData = NULL;
+
 /// 判定「这份数据是否可疑」——只有可疑才落日志。
 /// 正常状态下这几个 entry 应当是 enabled=YES 的；出现 nil 或 en=0 都值得记。
 static BOOL SVPNDataLooksSuspicious(id data, BOOL *hasAnyNil, BOOL *hasAnyDisabled) {
@@ -341,7 +346,7 @@ static void SVPNLogData(NSString *tag, id data) {
 
         // 蜂窝的文字内容（4G/5G/LTE），能反映「有新数据还是空壳」
         if (cel) {
-            NSString *str = nil, cross = nil;
+            NSString *str = nil, *cross = nil;
             @try { str = [cel valueForKey:@"string"]; } @catch (NSException *e) {}
             @try { cross = [cel valueForKey:@"crossfadeString"]; } @catch (NSException *e) {}
             [s appendFormat:@" cellStr=%@ cross=%@", str ?: @"nil", cross ?: @"nil"];
@@ -367,11 +372,13 @@ static void SVPNLogData(NSString *tag, id data) {
 #if SVPN_DIAG
     // ★ 只在数据可疑时记录：这个方法是每帧走的，绝不能无条件拼字符串。
     //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
+    //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax) {
+    if (gDiagCount < gDiagMax && (const void *)data != gLastLoggedData) {
         BOOL anyNil = NO, anyDis = NO;
         BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
         if (bad) {
+            gLastLoggedData = (const void *)data;
             gDiagCount++;
             gDiagSeq = gDiagCount;
             NSLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
@@ -401,10 +408,11 @@ static void SVPNLogData(NSString *tag, id data) {
 
 #if SVPN_DIAG
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax) {
+    if (gDiagCount < gDiagMax && (const void *)data != gLastLoggedData) {
         BOOL anyNil = NO, anyDis = NO;
         BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
         if (bad) {
+            gLastLoggedData = (const void *)data;
             gDiagCount++;
             gDiagSeq = gDiagCount;
             NSLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",

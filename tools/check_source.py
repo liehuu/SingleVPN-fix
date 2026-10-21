@@ -250,6 +250,50 @@ print("\n[A8] 诊断开关")
 chk("SVPN_DIAG 为 1（本版为诊断版）",
     re.search(r"^#define\s+SVPN_DIAG\s+1\b", src, re.M) is not None)
 
+print("\n[A9] 多变量声明漏指针星号")
+# 真实踩过：NSString *str = nil, cross = nil;
+# → clang: error: interface type cannot be statically allocated
+# 这类错一眼能看出，但导致 CI 白跑 12 分钟，必须静态拦住。
+# 判定：一行形如「类型 *a = ..., b = ...」中，b 之前没有 * 且类型是指针型/对象型。
+_PTR_TYPES = {
+    "NSString", "NSMutableString", "NSArray", "NSMutableArray", "NSDictionary",
+    "NSMutableDictionary", "NSSet", "NSNumber", "NSData", "NSDate",
+    "UIColor", "UIFont", "UIView", "UIImage", "UIImageView", "UIWindow",
+    "NSUserDefaults", "NSException", "NSMutableString",
+    "STStatusBarData", "STStatusBarDataEntry", "STUIStatusBar",
+    "STUIStatusBarStyleAttributes", "STUIStatusBarStringView",
+    "UITraitCollection", "NSLayoutConstraint",
+}
+_OBJ_PREFIXES = ("NS", "UI", "ST", "CA")
+
+star_bad = []
+for ln, raw in enumerate(lines, 1):
+    l = raw.strip()
+    if not l or l.startswith("//") or l.startswith("#") or l.startswith("*"):
+        continue
+    # 去掉行尾注释
+    l = re.sub(r"//.*$", "", l)
+    # 粗略去掉方法声明行（含 ) - 开头在下一行）
+    m = re.match(r"^(?:static\s+|const\s+|__block\s+|__weak\s+|__strong\s+)*"
+                 r"([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*(?:=[^;]*)?,\s*(.+)$", l)
+    if not m:
+        continue
+    typ, _, rest = m.group(1), m.group(2), m.group(3)
+    is_obj = typ in _PTR_TYPES or typ.startswith(_OBJ_PREFIXES) or typ == "id"
+    if not is_obj:
+        continue
+    # rest 里按逗号切分，逐项检查是否带 *
+    for part in rest.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        pm = re.match(r"^\**\s*([A-Za-z_]\w*)\s*=", p)
+        if pm and not p.startswith("*"):
+            star_bad.append("第 %d 行: %s 声明了 %s *%s 但 %s 缺少 * | %s" %
+                            (ln, typ, typ, m.group(2), pm.group(1), l[:80]))
+chk("对象指针多变量声明均带 *", not star_bad,
+    ("\n           ".join(star_bad)) if star_bad else "")
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:
