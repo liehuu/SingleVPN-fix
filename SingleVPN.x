@@ -1,6 +1,7 @@
 #import <HBLog.h>
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <time.h>          // clock_gettime / CLOCK_MONOTONIC（心跳节流用）
 
 #import "Common.h"
 #import "UIColor+.h"
@@ -259,6 +260,44 @@ static NSUInteger gStyleDiagCount = 0;
 /// 同一次渲染可能连着调好几次；同一份数据的对象地址相同就跳过，
 /// 避免重复拼字符串（热路径开销的主要来源）。
 static const void *gLastLoggedData = NULL;
+static const void *gLastLoggedData2 = NULL;   // _updateWithData: 专用，避免两个 hook 互相干扰去重
+
+/// ★ 心跳统计：解决「图标消失了但日志一片空白」的判定盲区。
+/// 如果只在数据可疑时记录，那"数据层一切正常但视图没画出来"这种情况
+/// 会留下零条 AGG 日志，拿到日志也无法区分是"没更新"还是"更新了但正常"。
+///
+/// ★ 但心跳本身绝不能变成新的热路径负担：
+///   - 计数用普通自增（无锁、无分配），几乎零开销
+///   - 只有「满 N 次」且「总条数未超限」且「距上次心跳超过 2 秒」才真正打日志
+///   - 总上限 gHeartbeatMax 条，防止状态栏动画期间刷爆文件
+/// 三条限制缺一不可 —— 直接写文件是主线程 IO，量大就是卡顿源。
+///
+/// ★ 顺序要求：这些变量必须定义在 SVPNHeartbeatDue 之前，
+///   否则函数体内引用到的是未声明的标识符（clang 直接报错）。
+static NSUInteger gAggCallCount = 0;
+static NSUInteger gUpdCallCount = 0;
+static NSUInteger gHeartbeatEvery = 50;
+static NSUInteger gHeartbeatSent = 0;
+static NSUInteger gHeartbeatMax = 12;
+static double gLastHeartbeatAt = 0;
+
+/// 心跳是否该真的打一条。三条闸门一起卡，任何一个不满足都直接返回 NO，
+/// 让热路径保持「读几个整数就结束」的开销水平。
+///
+/// 刻意用 clock_gettime 而不是 CACurrentMediaTime：后者要引 QuartzCore 头文件，
+/// 而本工程 Makefile 没有显式链该 framework（SpringBoard 进程内虽然一定有，
+/// 但编译期缺声明会报隐式声明，属于自找麻烦）。
+static BOOL SVPNHeartbeatDue(NSUInteger n) {
+    if (n % gHeartbeatEvery != 0) return NO;
+    if (gHeartbeatSent >= gHeartbeatMax) return NO;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return NO;
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    if (now - gLastHeartbeatAt < 2.0) return NO;
+    gLastHeartbeatAt = now;
+    gHeartbeatSent++;
+    return YES;
+}
 
 /// 判定「这份数据是否可疑」——只有可疑才落日志。
 /// 正常状态下这几个 entry 应当是 enabled=YES 的；出现 nil 或 en=0 都值得记。
@@ -506,17 +545,34 @@ static void SVPNLogData(NSString *tag, id data) {
     //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
     //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax && (__bridge const void *)data != gLastLoggedData) {
-        BOOL anyNil = NO, anyDis = NO;
-        BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-        if (bad) {
-            gLastLoggedData = (__bridge const void *)data;
-            gDiagCount++;
-            gDiagSeq = gDiagCount;
-            SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
-                  (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-            SVPNLogData(@"AGG  in ", data);
-            SVPNLogData(@"AGG  cur", currentData);
+    // 心跳：独立于 gDiagCount 上限，保证「数据一直正常」时也能证明 hook 在跑
+    gAggCallCount++;
+    if (SVPNHeartbeatDue(gAggCallCount)) {
+        BOOL hn = NO, hd = NO;
+        SVPNDataLooksSuspicious(data, &hn, &hd);
+        SVPNLog(@"[SVPN] HB agg n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
+              (unsigned long)gAggCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
+              SVPNEntryDesc(@"cell", currentData.cellularEntry),
+              SVPNEntryDesc(@"wifi", currentData.wifiEntry));
+    }
+    if (gDiagCount < gDiagMax) {
+        const void *addr = (__bridge const void *)data;
+        // 只有「和上一条完全同一份对象」才跳过，避免每帧重复拼串。
+        // 注意不能只在可疑时才更新 gLastLoggedData —— 那样同一地址
+        // 在「先正常、后可疑」两次回调里会被判成新数据而重复记录，
+        // 且在地址被复用时可能漏记。这里无条件记账，只做相邻去重。
+        if (addr != gLastLoggedData) {
+            gLastLoggedData = addr;
+            BOOL anyNil = NO, anyDis = NO;
+            BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+            if (bad) {
+                gDiagCount++;
+                gDiagSeq = gDiagCount;
+                SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
+                      (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+                SVPNLogData(@"AGG  in ", data);
+                SVPNLogData(@"AGG  cur", currentData);
+            }
         }
     }
 #endif
@@ -540,17 +596,30 @@ static void SVPNLogData(NSString *tag, id data) {
 
 #if SVPN_DIAG
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax && (__bridge const void *)data != gLastLoggedData) {
-        BOOL anyNil = NO, anyDis = NO;
-        BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-        if (bad) {
-            gLastLoggedData = (__bridge const void *)data;
-            gDiagCount++;
-            gDiagSeq = gDiagCount;
-            SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
-                  (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-            SVPNLogData(@"UPD  in ", data);
-            SVPNLogData(@"UPD  cur", currentData);
+    gUpdCallCount++;
+    if (SVPNHeartbeatDue(gUpdCallCount)) {
+        BOOL hn = NO, hd = NO;
+        SVPNDataLooksSuspicious(data, &hn, &hd);
+        SVPNLog(@"[SVPN] HB upd n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
+              (unsigned long)gUpdCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
+              SVPNEntryDesc(@"cell", currentData.cellularEntry),
+              SVPNEntryDesc(@"wifi", currentData.wifiEntry));
+    }
+    if (gDiagCount < gDiagMax) {
+        const void *addr = (__bridge const void *)data;
+        // 用独立变量做去重：两个 hook 共用一份会互相覆盖，导致该记的被跳过
+        if (addr != gLastLoggedData2) {
+            gLastLoggedData2 = addr;
+            BOOL anyNil = NO, anyDis = NO;
+            BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+            if (bad) {
+                gDiagCount++;
+                gDiagSeq = gDiagCount;
+                SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
+                      (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+                SVPNLogData(@"UPD  in ", data);
+                SVPNLogData(@"UPD  cur", currentData);
+            }
         }
     }
 #endif

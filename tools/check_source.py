@@ -327,9 +327,14 @@ chk("ObjC→C 指针转换均带 __bridge", not _ARC_BAD,
 print("\n[A11] 全局变量先定义后使用")
 # 加诊断代码时很容易「用了新计数器忘了定义」（gStyleDiagCount 就是这样差点漏掉）。
 # 这里扫描所有 g 开头的全局量：首次出现必须是 static 定义行。
+# ★ 必须跳过注释行：否则在注释里提到变量名（比如「总上限 gHeartbeatMax 条」）
+#   会被当成首次出现而误报，逼着人不敢在注释里写变量名，本末倒置。
 _g_undef = []
 _g_first = {}
 for ln, raw in enumerate(lines, 1):
+    stripped = raw.lstrip()
+    if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+        continue
     for m in re.finditer(r"\b(g[A-Z]\w*)\b", raw):
         name = m.group(1)
         if name not in _g_first:
