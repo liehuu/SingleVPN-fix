@@ -227,6 +227,135 @@ static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarD
 }
 // ============================================================================
 
+// ===== svpn 诊断（v2.1-5 专用，交付排查完即删）=============================
+// 目的：不再靠读源码猜。把「每次下发到状态栏的数据到底长什么样」记下来，
+//       以及「我们到底改没改它」，一次性搞清楚图标消失时是谁的问题。
+//
+// 输出：NSLog，前缀 [SVPN]。不写文件 —— RootHide 的 jbroot 在
+//       AppGroup 随机哈希目录里，SpringBoard 无该容器访问权（CellularTint 踩过），
+//       所以文件方案不可靠；NSLog 由系统统一收口，最省事也最不会失手。
+//
+// 用法：安装后 respring 几次，复现后把日志导出来看。
+// 判定要点见每条记录里的 isNil / isEn 字段。
+#define SVPN_DIAG 1
+
+#if SVPN_DIAG
+static NSUInteger gDiagCount = 0;
+static NSUInteger gDiagMax = 120;          // 异常样本上限
+
+/// 当前记录序号（0 表示这次没记录），供 out 段配平使用
+static NSUInteger gDiagSeq = 0;
+
+/// 颜色染色采样计数（单独计数，避免被数据异常记录挤满）
+static NSUInteger gColorDiagCount = 0;
+
+/// 判定「这份数据是否可疑」——只有可疑才落日志。
+/// 正常状态下这几个 entry 应当是 enabled=YES 的；出现 nil 或 en=0 都值得记。
+static BOOL SVPNDataLooksSuspicious(id data, BOOL *hasAnyNil, BOOL *hasAnyDisabled) {
+    BOOL anyNil = NO, anyDisabled = NO;
+    if (!data) {
+        if (hasAnyNil) *hasAnyNil = YES;
+        if (hasAnyDisabled) *hasAnyDisabled = NO;
+        return YES;
+    }
+    NSArray *keys = @[@"cellularEntry", @"wifiEntry"];
+    for (NSString *k in keys) {
+        id e = nil;
+        @try { e = [data valueForKey:k]; } @catch (NSException *ex) {}
+        if (!e) {
+            anyNil = YES;
+            continue;
+        }
+        BOOL en = NO;
+        @try {
+            if ([e respondsToSelector:@selector(isEnabled)]) en = [e isEnabled];
+        } @catch (NSException *ex) {}
+        if (!en) anyDisabled = YES;
+    }
+    if (hasAnyNil) *hasAnyNil = anyNil;
+    if (hasAnyDisabled) *hasAnyDisabled = anyDisabled;
+    return (anyNil || anyDisabled);
+}
+
+/// 把一个 entry 描述成「存在与否 + enabled + 类名」
+/// 关键：entry 可能为 nil（未下发）、也可能存在但 enabled=NO（空壳）
+static NSString *SVPNEntryDesc(NSString *name, id entry) {
+    if (!entry) {
+        return [NSString stringWithFormat:@"%@=nil", name];
+    }
+    BOOL en = NO;
+    @try {
+        if ([entry respondsToSelector:@selector(isEnabled)]) {
+            en = [entry isEnabled];
+        }
+    } @catch (NSException *e) {
+    }
+    return [NSString stringWithFormat:@"%@=obj(en=%d,%@)",
+                                      name, en, NSStringFromClass([entry class])];
+}
+
+/// 把颜色转成可比较的文本（不打印对象地址，否则每次日志都不一样，没法比对）
+static NSString *SVPNColorDesc(UIColor *c) {
+    if (!c) {
+        return @"nil";
+    }
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    BOOL rgb = NO;
+    @try {
+        rgb = [c getRed:&r green:&g blue:&b alpha:&a];
+    } @catch (NSException *e) {
+    }
+    if (!rgb) {
+        // 关键特征：getRed: 失败的颜色（动态色 / 灰度色 / 图案色）。
+        // svpn_isDarkColor 遇到这种会一律当亮色，是本插件最容易失手的地方。
+        return [NSString stringWithFormat:@"nonRGB(%@)", NSStringFromClass([c class])];
+    }
+    return [NSString stringWithFormat:@"rgba(%d,%d,%d,%d)",
+                    (int)lround(r * 255), (int)lround(g * 255),
+                    (int)lround(b * 255), (int)lround(a * 255)];
+}
+
+/// 一次性打印一条 STStatusBarData 的全貌
+static void SVPNLogData(NSString *tag, id data) {
+    if (!data) {
+        NSLog(@"[SVPN] %@ data=nil", tag);
+        return;
+    }
+
+    NSMutableString *s = [NSMutableString stringWithFormat:@"[SVPN] %@ {", tag];
+    @try {
+        // 这几个是我们关心的；vpn / cellular / wifi 直接读属性
+        id vpn = nil, cel = nil, sec = nil, wifi = nil;
+        @try { vpn = [data valueForKey:@"vpnEntry"]; } @catch (NSException *e) {}
+        @try { cel = [data valueForKey:@"cellularEntry"]; } @catch (NSException *e) {}
+        @try { sec = [data valueForKey:@"secondaryCellularEntry"]; } @catch (NSException *e) {}
+        @try { wifi = [data valueForKey:@"wifiEntry"]; } @catch (NSException *e) {}
+
+        [s appendString:SVPNEntryDesc(@"vpn", vpn)];
+        [s appendString:@" "];
+        [s appendString:SVPNEntryDesc(@"cell", cel)];
+        [s appendString:@" "];
+        [s appendString:SVPNEntryDesc(@"sec", sec)];
+        [s appendString:@" "];
+        [s appendString:SVPNEntryDesc(@"wifi", wifi)];
+
+        // 蜂窝的文字内容（4G/5G/LTE），能反映「有新数据还是空壳」
+        if (cel) {
+            NSString *str = nil, cross = nil;
+            @try { str = [cel valueForKey:@"string"]; } @catch (NSException *e) {}
+            @try { cross = [cel valueForKey:@"crossfadeString"]; } @catch (NSException *e) {}
+            [s appendFormat:@" cellStr=%@ cross=%@", str ?: @"nil", cross ?: @"nil"];
+        }
+    } @catch (NSException *e) {
+        [s appendFormat:@" <exception %@>", e.reason];
+    }
+    [s appendString:@"}"];
+    NSLog(@"%@", s);
+}
+
+#endif
+// ============================================================================
+
 %group SingleVPN_17
 
 %hook STUIStatusBar
@@ -235,9 +364,33 @@ static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarD
     STStatusBarData *currentData = [self currentData];
     _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
 
+#if SVPN_DIAG
+    // ★ 只在数据可疑时记录：这个方法是每帧走的，绝不能无条件拼字符串。
+    //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
+    gDiagSeq = 0;
+    if (gDiagCount < gDiagMax) {
+        BOOL anyNil = NO, anyDis = NO;
+        BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+        if (bad) {
+            gDiagCount++;
+            gDiagSeq = gDiagCount;
+            NSLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
+                  (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+            SVPNLogData(@"AGG  in ", data);
+            SVPNLogData(@"AGG  cur", currentData);
+        }
+    }
+#endif
+
     if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
         data = svpnMergeMissingEntries(self, data);
     }
+
+#if SVPN_DIAG
+    if (gDiagSeq) {
+        SVPNLogData(@"AGG  out", data);
+    }
+#endif
 
     %orig;
 }
@@ -246,9 +399,31 @@ static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarD
     STStatusBarData *currentData = [self currentData];
     _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
 
+#if SVPN_DIAG
+    gDiagSeq = 0;
+    if (gDiagCount < gDiagMax) {
+        BOOL anyNil = NO, anyDis = NO;
+        BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+        if (bad) {
+            gDiagCount++;
+            gDiagSeq = gDiagCount;
+            NSLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
+                  (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+            SVPNLogData(@"UPD  in ", data);
+            SVPNLogData(@"UPD  cur", currentData);
+        }
+    }
+#endif
+
     if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
         data = svpnMergeMissingEntries(self, data);
     }
+
+#if SVPN_DIAG
+    if (gDiagSeq) {
+        SVPNLogData(@"UPD  out", data);
+    }
+#endif
 
     %orig;
 }
@@ -362,6 +537,21 @@ static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarD
 
 - (void)setActiveColor:(UIColor *)activeColor {
     BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+
+#if SVPN_DIAG
+    // 只在「颜色为空」或「前 40 次染色」时记录 —— 后者用来抓
+    // respring 后第一批渲染的输入/输出颜色（暗色误判就发生在这里）。
+    // 正常染色不该额外产生任何日志，也不重复计算颜色。
+    if ((!activeColor || gColorDiagCount < 40) && gDiagCount < gDiagMax) {
+        gDiagCount++;
+        gColorDiagCount++;
+        NSLog(@"[SVPN] #%lu WIFI setActiveColor in=%@ tint=%d out=%@ self=%@",
+              (unsigned long)gDiagCount, SVPNColorDesc(activeColor), (int)decision,
+              SVPNColorDesc(decision ? svpnColorWithTextColor(activeColor) : activeColor),
+              NSStringFromClass([self class]));
+    }
+#endif
+
     if (decision) {
         activeColor = svpnColorWithTextColor(activeColor);
     }
@@ -399,6 +589,45 @@ static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarD
     if (!_isEnabled) {
         return;
     }
+
+#if SVPN_DIAG
+    // 启动快照：先确认「我们以为 hook 到的类」真的存在。
+    // 若某个类是 Nil，那套 hook 就是空转 —— 所有基于它的推理全部失效。
+    NSLog(@"[SVPN] ==== ctor begin ====");
+    NSLog(@"[SVPN] prefs IsEnabled=%d Rev=%d Force5GA=%d light=%@ dark=%@",
+          (int)_isEnabled, (int)_isEnabledReversed, (int)_isForce5GAEnabled,
+          SVPNColorDesc(_lightReplacementColor), SVPNColorDesc(_darkReplacementColor));
+
+    // 外观 + 系统色基准：svpn_isDarkColor 对「非 RGB 色」一律返回 NO（当亮色处理），
+    // 所以在浅色模式下遇到动态色会选错色。这里把判定结果直接打出来。
+    @try {
+        UITraitCollection *tr = nil;
+        @try { tr = [(id)[UIApplication sharedApplication] traitCollection]; }
+        @catch (NSException *e) {}
+        NSString *style = @"?";
+        if (tr) {
+            style = (tr.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+        }
+        UIColor *labelC = nil;
+        @try { labelC = [UIColor labelColor]; } @catch (NSException *e) {}
+        BOOL dark = NO;
+        @try { dark = [labelC svpn_isDarkColor]; } @catch (NSException *e) {}
+        NSLog(@"[SVPN] appearance=%@ labelColor=%@ isDark=%d => pick=%@",
+              style, SVPNColorDesc(labelC), (int)dark,
+              SVPNColorDesc(svpnColorWithTextColor(labelC)));
+    } @catch (NSException *e) {
+        NSLog(@"[SVPN] appearance probe failed: %@", e.reason);
+    }
+    NSArray *cls = @[@"STUIStatusBar", @"STUIStatusBarCellularNetworkTypeView",
+                     @"STUIStatusBarStringView", @"STUIStatusBarWifiSignalView",
+                     @"STUIStatusBarCellularSignalView",
+                     @"STUIStatusBarDualCellularSignalView"];
+    for (NSString *n in cls) {
+        Class c = NSClassFromString(n);
+        NSLog(@"[SVPN] class %@ = %@", n, c ? @"FOUND" : @"NIL");
+    }
+    NSLog(@"[SVPN] ==== ctor end ====");
+#endif
 
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(), 

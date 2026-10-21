@@ -66,16 +66,14 @@ jobs:
             diff -u /tmp/s16_old.txt /tmp/s16_new.txt || true
           fi
 
-          echo "=== 5) 括号平衡 ==="
-          for p in '{}' '()'; do
-            o=${p%?}; c=${p#?}
-            no=$(tr -cd "$o" < SingleVPN.x | wc -c)
-            nc=$(tr -cd "$c" < SingleVPN.x | wc -c)
-            echo "  $p : $no vs $nc"
-            [ "$no" -eq "$nc" ] || { echo "FAIL: $p 不配对"; exit 1; }
-          done
+          echo "=== 5) 括号与 NSLog 参数（交给 tools/check_source.py）==="
+          # 不再用 tr -cd 数括号：宏续行、字符串内的括号都会污染计数，
+          # 本地已因此产生假失败。统一由 Python 检查（剔除注释/字符串后再算）。
 
-          echo "ALL SOURCE CHECKS PASSED"
+      - name: Source self-check (single source of truth)
+        run: |
+          set -e
+          python3 tools/check_source.py
 
   build:
     needs: verify
