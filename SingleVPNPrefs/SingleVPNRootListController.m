@@ -100,7 +100,12 @@ void SingleVPNBatchKillAll(NSArray<NSString *> *processNames, BOOL softly) {
         for (PSSpecifier *spec in specs) {
             NSString *cellClassName = [spec propertyForKey:@"cellClass"];
             if ([cellClassName isKindOfClass:[NSString class]]) {
-                [spec setProperty:NSClassFromString(cellClassName) forKey:@"cellClass"];
+                // ★ 不能写 [spec setProperty:... forKey:...]：
+                //   与 NSStream 的 -setProperty:forKey: 同名异签名，clang 会硬报
+                //   "multiple methods named ... found with mismatched result"。
+                //   走 SVPNSetSpecifierProperty（Preferences.h 里的 static inline，
+                //   用 NSSelectorFromString + methodForSelector 绕开编译期签名解析）。
+                SVPNSetSpecifierProperty(spec, @"cellClass", NSClassFromString(cellClassName));
             }
             if (@available(iOS 17, *)) {
             } else {
