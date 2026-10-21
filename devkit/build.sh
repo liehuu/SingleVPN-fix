@@ -58,6 +58,24 @@ if grep -qE '^\s*%hook|%orig' "$GEN"; then
   exit 1
 fi
 
+# ★ internal 后端断言：Logos 默认（MobileSubstrate）后端会注入 #include <substrate.h>，
+#   那是 Theos 私有头，零 Theos 环境下 clang 直接 fatal error。
+#   源码首行写了 %config(generator=internal)，这里验证它**真的生效**了：
+#     - 不能出现 substrate.h
+#     - 必须出现 objc/message.h（internal 的 preamble）
+#     - 必须出现它自带的 register_hook 实现（否则 %orig 无定义，链接期不会报错，
+#       因为 -undefined dynamic_lookup 把一切都放过，只在运行时炸）
+if grep -q 'substrate\.h' "$GEN"; then
+  echo "✗ 产物仍引用 substrate.h，%config(generator=internal) 未生效"
+  grep -n 'substrate\.h' "$GEN" | head -3
+  exit 1
+fi
+grep -q 'objc/message\.h' "$GEN" \
+  || { echo "✗ 产物缺 objc/message.h，internal 后端未生效"; exit 1; }
+grep -q 'register_hook' "$GEN" \
+  || { echo "✗ 产物缺 internal 后端的 register_hook 实现"; exit 1; }
+echo "✓ Logos internal 后端生效（无 substrate.h 依赖）"
+
 # ---------- 2) 编译 dylib ----------
 # -undefined dynamic_lookup：MSHookMessageEx / STStatusBarData* 等私有符号
 # 留到运行时由 SpringBoard 解析，链接期不要求存在。

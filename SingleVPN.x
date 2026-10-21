@@ -3,6 +3,19 @@
 //   （xcrun clang 直编 + vendored logos.pl），编不到。
 //   原文件只有一行 #import <HBLog.h>，全文没有任何 HBLog() 调用，直接删除。
 //   需要 hook 运行时符号时，用 -undefined dynamic_lookup 让 SpringBoard 在运行时解析。
+//
+// ★★ 必须指定 internal 后端（零 Theos 构建的前提）：
+//   Logos 默认后端是 MobileSubstrate，它的 preamble() 会强行注入
+//   `#include <substrate.h>` —— 那是 Theos 自带的头，零 Theos 环境下编不到，
+//   CI 实测报 `SingleVPN.x:98:10: fatal error: 'substrate.h' file not found`。
+//   internal 后端只注入 `#include <objc/message.h>`（系统 SDK 自带），
+//   并且自带一份 register_hook 实现（class_copyMethodList + method_setImplementation
+//   + class_addMethod 沿继承链上溯），语义与 MSHookMessageEx 一致：
+//     - 方法在本类：method_setImplementation 换掉，orig 拿到旧 IMP
+//     - 方法在父类：class_addMethod 加到子类，orig 拿父类 IMP（不污染父类，更安全）
+//   本项目 7 个 %hook / 15 处 %orig / 无任何直接 MSHook* 调用，internal 完全够用。
+%config(generator=internal)
+
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <time.h>          // clock_gettime / CLOCK_MONOTONIC（心跳节流用）
