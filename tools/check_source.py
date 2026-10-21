@@ -16,6 +16,7 @@
   A14 脚本在 git 索引里必须是 100755
   A15 CI 不得再安装整套 Theos（零 Theos 构建）
   A16 shell 里 $VAR 后不得紧跟中文/全角字符（会被算进变量名）
+  A17 打包脚本必须用 GNU tar 格式（PAX 扩展头会让 dpkg 拒绝安装）
 
 参数：可传 --no-cross 跳过跨行 NSLog 检查（调试用）
 """
@@ -472,6 +473,170 @@ for _root, _dirs, _fs in os.walk(os.path.join(_REPO, 'devkit')):
                                 % (os.path.relpath(_p, _REPO), _ln, _m.group(1), _m.group(2)))
 chk("devkit/*.sh 无 $VAR 紧邻全角字符", not _var_bad,
     ("; ".join(_var_bad)) if _var_bad else "全部使用 ${VAR} 或 ASCII 边界")
+
+print("\n[A17] 打包脚本必须用 GNU tar 格式（PAX 会让 dpkg 装不上）")
+# 真实事故（2026-10-21 用户实机安装失败，截图报错）：
+#   corrupted filesystem tarfile in package archive:
+#   unsupported PAX tar header type 'x'
+#   W: Unknown TAR header type 120
+#   E: Sub-process /usr/bin/dpkg returned an error code (1)
+# 根因：Python 3.8+ 的 tarfile.open(mode='w') 默认 PAX_FORMAT，遇到
+#   mtime 带小数秒 / 路径非 ASCII 时，给**每个**成员插一个 typeflag='x' 的
+#   ././@PaxHeader。实测那个 deb 的 data.tar 里有 26~27 个。
+# dpkg 的 tar 实现只认 ustar/GNU，不认 PAX 扩展头 → 装包直接失败。
+# 修法：所有 tarfile.open(...) 都必须显式 format=tarfile.GNU_FORMAT。
+_mk = os.path.join(_REPO, 'devkit', 'mkdeb.sh')
+
+
+def _code_hits(txt, needle):
+    """返回 txt 里所有「引号闭合状态下」出现的 needle 的 (起始下标, 上下文)。
+
+    ★ 这个坑在本项目已经犯过四次（A11 / A15 / A16 / A17）：
+      检查器把「解释为什么不能用某个写法」的说明文字当成了「真的用了」。
+      前三次靠「剔除以 # 开头的行」能糊过去，这次不行 —— 命中的两处都不是
+      bash 注释，而是嵌在 `python3 - <<'PY'` heredoc 里的：
+        ① 函数 docstring 举例：`Python 3.8+ 的 tarfile.open(mode='w') 默认…`
+        ② print 的字符串参数：`print('   修法：tarfile.open(..., format=…)')`
+      按「行首 #」剔不掉，按 strip_code 逐行处理也剔不干净（三引号跨行）。
+
+    可靠判据是**扫描到该位置时引号是否闭合**：
+      真代码 `with tarfile.open(fileobj=buf, mode='w', …)` → 引号为 None；
+      docstring / print 字符串里的 → 前面必有一个未闭合的引号。
+    shell 与 python 都适用（mkdeb.sh 里没有跨行转义引号这种写法）。
+    """
+    hits = []
+    quote = None
+    i, n = 0, len(txt)
+    while i < n:
+        if quote is None:
+            for q in ('"""', "'''"):
+                if txt.startswith(q, i):
+                    quote = q
+                    i += 3
+                    break
+            else:
+                c = txt[i]
+                if c in ('"', "'"):
+                    quote = c
+                    i += 1
+                    continue
+                if txt.startswith(needle, i):
+                    hits.append(txt[max(0, i - 40):i + len(needle) + 40])
+                    i += len(needle)
+                    continue
+                if c == '\\':
+                    i += 2
+                    continue
+                i += 1
+            continue
+        # 在引号内：找闭合
+        if len(quote) == 3:
+            if txt.startswith(quote, i):
+                quote = None
+                i += 3
+                continue
+            if txt[i] == '\\':
+                i += 2
+                continue
+            i += 1
+        else:
+            if txt[i] == '\\':
+                i += 2
+                continue
+            if txt[i] == quote:
+                quote = None
+            elif txt[i] == '\n' and quote == "'" and False:
+                quote = None
+            i += 1
+    return hits
+
+
+def _code_hits(txt, needle):
+    """返回 txt 里所有「引号闭合状态下」出现的 needle 的 (起始下标, 上下文)。
+
+    逐字符扫，维护 quote 状态：未闭合 / 单引号 / 双引号 / 三引号。
+    遇到 needle 时若 quote 为「未闭合」才算真代码命中 —— 文档串里的举例不算。
+    shell 与 python 都适用：本文件用到的范围内两者引号规则一致
+    （mkdeb.sh 里没有跨行转义引号这种写法）。
+    """
+    hits = []
+    quote = None
+    i, n = 0, len(txt)
+    while i < n:
+        if quote is None:
+            if txt.startswith('"""', i) or txt.startswith("'''", i):
+                quote = txt[i:i + 3]
+                i += 3
+                continue
+            c = txt[i]
+            if c == '\\':
+                i += 2
+                continue
+            if c in ('"', "'"):
+                quote = c
+                i += 1
+                continue
+            if txt.startswith(needle, i):
+                hits.append((i, txt[max(0, i - 40):i + len(needle) + 40]))
+                i += len(needle)
+                continue
+            i += 1
+        else:
+            if len(quote) == 3:
+                if txt.startswith(quote, i):
+                    quote = None
+                    i += 3
+                    continue
+                if txt[i] == '\\':
+                    i += 2
+                    continue
+                i += 1
+            else:
+                if txt[i] == '\\':
+                    i += 2
+                    continue
+                if txt[i] == quote:
+                    quote = None
+                i += 1
+    return hits
+
+
+def _call_args(txt, start):
+    """从 `tarfile.open(` 的 start 位置起，取到配对的右括号为止（含）。"""
+    i = txt.index('(', start)
+    depth = 0
+    while i < len(txt):
+        if txt[i] == '(':
+            depth += 1
+        elif txt[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return txt[start:i + 1]
+        i += 1
+    return txt[start:start + 200]
+
+
+if os.path.isfile(_mk):
+    _mk_txt = open(_mk, encoding='utf-8').read()
+    # 只在「引号外」的实代码里找 tarfile.open，注释与字符串里的举例不算
+    _open_pos = _code_hits(_mk_txt, 'tarfile.open(')
+    _calls = [_call_args(_mk_txt, p) for p, _ in _open_pos]
+    _no_fmt = [c for c in _calls if 'format=' not in c]
+    chk("mkdeb.sh 的 tarfile.open 都指定了 format",
+        bool(_calls) and not _no_fmt,
+        ("%d 处未指定格式: %s" % (len(_no_fmt), _no_fmt[0][:60])) if _no_fmt
+        else "%d 处全部显式指定" % len(_calls))
+    _has_gnu = bool(_code_hits(_mk_txt, 'tarfile.GNU_FORMAT'))
+    chk("mkdeb.sh 使用 tarfile.GNU_FORMAT（不用 PAX）",
+        _has_gnu,
+        "" if _has_gnu else "缺 GNU_FORMAT，会产出 PAX 头")
+    # 反向断言：实代码里不该显式选 PAX（注释里提到 PAX_FORMAT 是为了说明原因，不算）
+    _pax_hits = _code_hits(_mk_txt, 'PAX_FORMAT')
+    chk("mkdeb.sh 代码里未显式选 PAX_FORMAT",
+        not _pax_hits,
+        "" if not _pax_hits else "显式用了 PAX，dpkg 会拒绝: %s" % _pax_hits[0][1])
+    chk("mkdeb.sh 里有 PAX 扩展头自检闸门",
+        '_check_no_pax_headers' in _mk_txt)
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

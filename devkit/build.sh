@@ -9,7 +9,7 @@
 # 私有 framework 用仓库内自备的 .tbd（SingleVPNPrefs/Frameworks/Preferences.tbd）。
 #
 # 用法：sh devkit/build.sh <arm64|arm64e> <arch-name> <version>
-#   例：sh devkit/build.sh arm64e iphoneos-arm64e 2.1-6
+#   例：sh devkit/build.sh arm64e iphoneos-arm64e 2.1-7
 set -eu
 
 CPU="${1:?用法: build.sh <arm64|arm64e> <arch-name> <version>}"

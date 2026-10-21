@@ -905,7 +905,7 @@ static void SVPNLogData(NSString *tag, id data) {
 #if SVPN_DIAG
     // ★ 必须在 IsEnabled 判断之前打：否则「插件被关掉」时一条日志都没有，
     //   会被误判成「诊断版没装上」，白跑一轮。
-    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-6)");
+    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-7)");
     SVPNLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
     // 告诉用户日志落在哪：抓不到系统日志时可直接用 Filza 打开这个文件
     NSString *svpn_lp = SVPNLogFilePath();
