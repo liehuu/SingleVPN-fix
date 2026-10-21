@@ -259,6 +259,7 @@ static NSUInteger gStyleDiagCount = 0;
 /// 同一次渲染可能连着调好几次；同一份数据的对象地址相同就跳过，
 /// 避免重复拼字符串（热路径开销的主要来源）。
 static const void *gLastLoggedData = NULL;
+static const void *gLastLoggedData2 = NULL;   // _updateWithData: 专用，避免两个 hook 互相干扰去重
 
 /// 判定「这份数据是否可疑」——只有可疑才落日志。
 /// 正常状态下这几个 entry 应当是 enabled=YES 的；出现 nil 或 en=0 都值得记。
@@ -506,17 +507,24 @@ static void SVPNLogData(NSString *tag, id data) {
     //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
     //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax && (__bridge const void *)data != gLastLoggedData) {
-        BOOL anyNil = NO, anyDis = NO;
-        BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-        if (bad) {
-            gLastLoggedData = (__bridge const void *)data;
-            gDiagCount++;
-            gDiagSeq = gDiagCount;
-            SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
-                  (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-            SVPNLogData(@"AGG  in ", data);
-            SVPNLogData(@"AGG  cur", currentData);
+    if (gDiagCount < gDiagMax) {
+        const void *addr = (__bridge const void *)data;
+        // 只有「和上一条完全同一份对象」才跳过，避免每帧重复拼串。
+        // 注意不能只在可疑时才更新 gLastLoggedData —— 那样同一地址
+        // 在「先正常、后可疑」两次回调里会被判成新数据而重复记录，
+        // 且在地址被复用时可能漏记。这里无条件记账，只做相邻去重。
+        if (addr != gLastLoggedData) {
+            gLastLoggedData = addr;
+            BOOL anyNil = NO, anyDis = NO;
+            BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+            if (bad) {
+                gDiagCount++;
+                gDiagSeq = gDiagCount;
+                SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
+                      (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+                SVPNLogData(@"AGG  in ", data);
+                SVPNLogData(@"AGG  cur", currentData);
+            }
         }
     }
 #endif
@@ -540,17 +548,21 @@ static void SVPNLogData(NSString *tag, id data) {
 
 #if SVPN_DIAG
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax && (__bridge const void *)data != gLastLoggedData) {
-        BOOL anyNil = NO, anyDis = NO;
-        BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-        if (bad) {
-            gLastLoggedData = (__bridge const void *)data;
-            gDiagCount++;
-            gDiagSeq = gDiagCount;
-            SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
-                  (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-            SVPNLogData(@"UPD  in ", data);
-            SVPNLogData(@"UPD  cur", currentData);
+    if (gDiagCount < gDiagMax) {
+        const void *addr = (__bridge const void *)data;
+        // 用独立变量做去重：两个 hook 共用一份会互相覆盖，导致该记的被跳过
+        if (addr != gLastLoggedData2) {
+            gLastLoggedData2 = addr;
+            BOOL anyNil = NO, anyDis = NO;
+            BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+            if (bad) {
+                gDiagCount++;
+                gDiagSeq = gDiagCount;
+                SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
+                      (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+                SVPNLogData(@"UPD  in ", data);
+                SVPNLogData(@"UPD  cur", currentData);
+            }
         }
     }
 #endif
