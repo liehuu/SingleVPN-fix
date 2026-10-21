@@ -294,6 +294,43 @@ for ln, raw in enumerate(lines, 1):
 chk("对象指针多变量声明均带 *", not star_bad,
     ("\n           ".join(star_bad)) if star_bad else "")
 
+print("\n[A10] ARC 桥接转换")
+# 真实踩过两次：
+#   ① NSData 用 NSString 的 writeToFile:...（类型用错）
+#   ② (const void *)data —— clang: requires a bridged cast
+# 本插件 Makefile 带 -fobjc-arc，ObjC 指针转 C 指针必须显式 __bridge，
+# 否则直接编译失败。这里查「(void *)<objc 变量>」这类裸转换。
+_ARC_BAD = []
+for ln, raw in enumerate(lines, 1):
+    l = re.sub(r"//.*$", "", raw)
+    if "__bridge" in l or "__bridge_transfer" in l or "CFBridging" in l:
+        continue
+    for m in re.finditer(r"\(\s*(?:const\s+)?void\s*\*\s*\)\s*([A-Za-z_]\w*)", l):
+        name = m.group(1)
+        # 排除明显是 C 变量的：CGFloat/int/BOOL/char 等
+        if name in ("NULL", "nil", "0"):
+            continue
+        _ARC_BAD.append("第 %d 行: 裸转 C 指针需 __bridge | %s" % (ln, l.strip()[:90]))
+chk("ObjC→C 指针转换均带 __bridge", not _ARC_BAD,
+    ("\n           ".join(_ARC_BAD)) if _ARC_BAD else "")
+
+print("\n[A11] 全局变量先定义后使用")
+# 加诊断代码时很容易「用了新计数器忘了定义」（gStyleDiagCount 就是这样差点漏掉）。
+# 这里扫描所有 g 开头的全局量：首次出现必须是 static 定义行。
+_g_undef = []
+_g_first = {}
+for ln, raw in enumerate(lines, 1):
+    for m in re.finditer(r"\b(g[A-Z]\w*)\b", raw):
+        name = m.group(1)
+        if name not in _g_first:
+            _g_first[name] = (ln, raw.strip())
+for name, (ln, l) in sorted(_g_first.items()):
+    if not re.match(r"\s*static\s", l):
+        _g_undef.append("%s 首次出现在第 %d 行但不是 static 定义 | %s" % (name, ln, l[:80]))
+chk("g* 全局量均先定义", not _g_undef,
+    ("\n           ".join(_g_undef)) if _g_undef else
+    "共 %d 个：%s" % (len(_g_first), ",".join(sorted(_g_first))))
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:

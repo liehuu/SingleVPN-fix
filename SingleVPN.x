@@ -249,6 +249,9 @@ static NSUInteger gDiagSeq = 0;
 /// 颜色染色采样计数（单独计数，避免被数据异常记录挤满）
 static NSUInteger gColorDiagCount = 0;
 
+/// styleAttrs 染色采样计数（蜂窝图标走这里，与 WiFi 的 activeColor 分开计）
+static NSUInteger gStyleDiagCount = 0;
+
 /// 上一份被记录过的 data 指针。_updateWithAggregatedData: 每帧都走，
 /// 同一次渲染可能连着调好几次；同一份数据的对象地址相同就跳过，
 /// 避免重复拼字符串（热路径开销的主要来源）。
@@ -256,6 +259,10 @@ static const void *gLastLoggedData = NULL;
 
 /// 判定「这份数据是否可疑」——只有可疑才落日志。
 /// 正常状态下这几个 entry 应当是 enabled=YES 的；出现 nil 或 en=0 都值得记。
+///
+/// ★ 关于副卡：单卡设备上 secondaryCellularEntry 本来就没有，
+///   nil 是正常的，不能算可疑。所以这里对副卡用「存在但 disabled」作为判据，
+///   而不是「为 nil」——这样单卡不会刷屏，双卡真降级时又能抓到。
 static BOOL SVPNDataLooksSuspicious(id data, BOOL *hasAnyNil, BOOL *hasAnyDisabled) {
     BOOL anyNil = NO, anyDisabled = NO;
     if (!data) {
@@ -263,8 +270,9 @@ static BOOL SVPNDataLooksSuspicious(id data, BOOL *hasAnyNil, BOOL *hasAnyDisabl
         if (hasAnyDisabled) *hasAnyDisabled = NO;
         return YES;
     }
-    NSArray *keys = @[@"cellularEntry", @"wifiEntry"];
-    for (NSString *k in keys) {
+    // 主卡 / WiFi：缺失和停用都算可疑
+    NSArray *mustKeys = @[@"cellularEntry", @"wifiEntry"];
+    for (NSString *k in mustKeys) {
         id e = nil;
         @try { e = [data valueForKey:k]; } @catch (NSException *ex) {}
         if (!e) {
@@ -277,6 +285,18 @@ static BOOL SVPNDataLooksSuspicious(id data, BOOL *hasAnyNil, BOOL *hasAnyDisabl
         } @catch (NSException *ex) {}
         if (!en) anyDisabled = YES;
     }
+    // 副卡：只有「存在但停用」才可疑
+    @try {
+        id sec = [data valueForKey:@"secondaryCellularEntry"];
+        if (sec) {
+            BOOL en = NO;
+            @try {
+                if ([sec respondsToSelector:@selector(isEnabled)]) en = [sec isEnabled];
+            } @catch (NSException *ex) {}
+            if (!en) anyDisabled = YES;
+        }
+    } @catch (NSException *ex) {}
+
     if (hasAnyNil) *hasAnyNil = anyNil;
     if (hasAnyDisabled) *hasAnyDisabled = anyDisabled;
     return (anyNil || anyDisabled);
@@ -374,11 +394,11 @@ static void SVPNLogData(NSString *tag, id data) {
     //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
     //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax && (const void *)data != gLastLoggedData) {
+    if (gDiagCount < gDiagMax && (__bridge const void *)data != gLastLoggedData) {
         BOOL anyNil = NO, anyDis = NO;
         BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
         if (bad) {
-            gLastLoggedData = (const void *)data;
+            gLastLoggedData = (__bridge const void *)data;
             gDiagCount++;
             gDiagSeq = gDiagCount;
             NSLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
@@ -408,11 +428,11 @@ static void SVPNLogData(NSString *tag, id data) {
 
 #if SVPN_DIAG
     gDiagSeq = 0;
-    if (gDiagCount < gDiagMax && (const void *)data != gLastLoggedData) {
+    if (gDiagCount < gDiagMax && (__bridge const void *)data != gLastLoggedData) {
         BOOL anyNil = NO, anyDis = NO;
         BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
         if (bad) {
-            gLastLoggedData = (const void *)data;
+            gLastLoggedData = (__bridge const void *)data;
             gDiagCount++;
             gDiagSeq = gDiagCount;
             NSLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
@@ -578,6 +598,22 @@ static void SVPNLogData(NSString *tag, id data) {
 
 - (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
     BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+
+#if SVPN_DIAG
+    // 这是蜂窝图标真正吃染色的入口（改的是 styleAttrs 的 imageTintColor，
+    // 不是 view 的 activeColor）。前 40 次 + 输入为空时记录。
+    if ((!styleAttrs || gStyleDiagCount < 40) && gDiagCount < gDiagMax) {
+        gDiagCount++;
+        gStyleDiagCount++;
+        UIColor *inColor = nil;
+        @try { inColor = styleAttrs.textColor; } @catch (NSException *e) {}
+        NSLog(@"[SVPN] #%lu STYLE in=%@ tint=%d out=%@ self=%@",
+              (unsigned long)gDiagCount, SVPNColorDesc(inColor), (int)decision,
+              SVPNColorDesc(decision ? svpnColorWithTextColor(inColor) : inColor),
+              NSStringFromClass([self class]));
+    }
+#endif
+
     if (decision) {
         styleAttrs = [styleAttrs copy];
         UIColor *newColor = svpnColorWithTextColor(styleAttrs.textColor);
@@ -594,7 +630,18 @@ static void SVPNLogData(NSString *tag, id data) {
 
 %ctor {
     ReloadPrefs();
+
+#if SVPN_DIAG
+    // ★ 必须在 IsEnabled 判断之前打：否则「插件被关掉」时一条日志都没有，
+    //   会被误判成「诊断版没装上」，白跑一轮。
+    NSLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-5)");
+    NSLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
+#endif
+
     if (!_isEnabled) {
+#if SVPN_DIAG
+        NSLog(@"[SVPN] ==== ctor exit: plugin disabled in prefs, no hooks ====");
+#endif
         return;
     }
 
@@ -610,11 +657,20 @@ static void SVPNLogData(NSString *tag, id data) {
     // 所以在浅色模式下遇到动态色会选错色。这里把判定结果直接打出来。
     @try {
         UITraitCollection *tr = nil;
-        @try { tr = [(id)[UIApplication sharedApplication] traitCollection]; }
-        @catch (NSException *e) {}
+        @try {
+            UIApplication *app = [UIApplication sharedApplication];
+            if (app) {
+                tr = [(id)app traitCollection];
+            }
+        } @catch (NSException *e) {}
+        if (!tr) {
+            // %ctor 阶段 sharedApplication 可能还没建好，用当前 trait 兜底
+            @try { tr = [UITraitCollection currentTraitCollection]; } @catch (NSException *e) {}
+        }
         NSString *style = @"?";
         if (tr) {
-            style = (tr.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark" : @"light";
+            style = (tr.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark"
+                   : (tr.userInterfaceStyle == UIUserInterfaceStyleLight ? @"light" : @"unspecified");
         }
         UIColor *labelC = nil;
         @try { labelC = [UIColor labelColor]; } @catch (NSException *e) {}
@@ -633,6 +689,29 @@ static void SVPNLogData(NSString *tag, id data) {
     for (NSString *n in cls) {
         Class c = NSClassFromString(n);
         NSLog(@"[SVPN] class %@ = %@", n, c ? @"FOUND" : @"NIL");
+    }
+
+    // ★ 私有 API 存在性探测：这几处在染色路径上被直接调用，
+    //   如果类不支持某选择子，运行时就是 unrecognized selector（可能崩 SpringBoard）。
+    //   本段只做查询，不调用，无副作用。
+    @try {
+        Class sc = NSClassFromString(@"STUIStatusBarStyleAttributes");
+        if (sc) {
+            NSArray *sels = @[@"copy", @"copyWithZone:",
+                              @"setImageTintColor:", @"setImageDimmedTintColor:",
+                              @"textColor", @"setTextColor:"];
+            NSMutableArray *have = [NSMutableArray array];
+            NSMutableArray *miss = [NSMutableArray array];
+            for (NSString *s in sels) {
+                BOOL inst = [sc instancesRespondToSelector:NSSelectorFromString(s)];
+                [(inst ? have : miss) addObject:s];
+            }
+            NSLog(@"[SVPN] StyleAttributes SUPPORTED=%@ MISSING=%@", have, miss);
+        } else {
+            NSLog(@"[SVPN] StyleAttributes = NIL");
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[SVPN] selector probe failed: %@", e.reason);
     }
     NSLog(@"[SVPN] ==== ctor end ====");
 #endif
