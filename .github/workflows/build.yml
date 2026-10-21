@@ -61,10 +61,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+      # 不用固定 Xcode 版本 15.4：macos-latest 镜像已滚到更新版本，
+      # 报 "Could not find Xcode version that satisfied version spec: '15.4'"。
+      # 本工程只用 xcrun clang + iPhoneOS SDK，对 Xcode 版本没有特殊要求。
+      - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '15.4'
+          xcode-version: latest-stable
 
       # logos.pl 已 vendor 进仓库（vendor/logos，270KB，纯 perl 无二进制依赖），
       # 不再依赖运行时从 raw.githubusercontent 下载（该域名在国内网络常不可达）。
