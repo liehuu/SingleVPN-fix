@@ -550,9 +550,10 @@ static void SVPNLogData(NSString *tag, id data) {
     if (SVPNHeartbeatDue(gAggCallCount)) {
         BOOL hn = NO, hd = NO;
         SVPNDataLooksSuspicious(data, &hn, &hd);
-        SVPNLog(@"[SVPN] HB agg n=%lu nil=%d dis=%d vpnOn=%d cur=%@",
+        SVPNLog(@"[SVPN] HB agg n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
               (unsigned long)gAggCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
-              SVPNEntryDesc(@"cell", currentData.cellularEntry));
+              SVPNEntryDesc(@"cell", currentData.cellularEntry),
+              SVPNEntryDesc(@"wifi", currentData.wifiEntry));
     }
     if (gDiagCount < gDiagMax) {
         const void *addr = (__bridge const void *)data;
@@ -599,9 +600,10 @@ static void SVPNLogData(NSString *tag, id data) {
     if (SVPNHeartbeatDue(gUpdCallCount)) {
         BOOL hn = NO, hd = NO;
         SVPNDataLooksSuspicious(data, &hn, &hd);
-        SVPNLog(@"[SVPN] HB upd n=%lu nil=%d dis=%d vpnOn=%d cur=%@",
+        SVPNLog(@"[SVPN] HB upd n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
               (unsigned long)gUpdCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
-              SVPNEntryDesc(@"cell", currentData.cellularEntry));
+              SVPNEntryDesc(@"cell", currentData.cellularEntry),
+              SVPNEntryDesc(@"wifi", currentData.wifiEntry));
     }
     if (gDiagCount < gDiagMax) {
         const void *addr = (__bridge const void *)data;
