@@ -301,15 +301,25 @@ print("\n[A10] ARC 桥接转换")
 # 本插件 Makefile 带 -fobjc-arc，ObjC 指针转 C 指针必须显式 __bridge，
 # 否则直接编译失败。这里查「(void *)<objc 变量>」这类裸转换。
 _ARC_BAD = []
+# 这些 API 的第一个参数要的是「函数/符号地址」，函数指针转 C 指针不受 ARC 约束，
+# 写成 __bridge 反而是错的（ARC 只管 ObjC 对象指针）。这里整行豁免。
+_ADDR_API = ("dladdr", "dlsym", "dlopen", "dlerror", "pthread_create",
+             "imp_implementationWithBlock", "method_setImplementation")
 for ln, raw in enumerate(lines, 1):
     l = re.sub(r"//.*$", "", raw)
     if "__bridge" in l or "__bridge_transfer" in l or "CFBridging" in l:
         continue
+    if any(api + "(" in l for api in _ADDR_API):
+        continue
     for m in re.finditer(r"\(\s*(?:const\s+)?void\s*\*\s*\)\s*([A-Za-z_]\w*)", l):
         name = m.group(1)
-        # 排除明显是 C 变量的：CGFloat/int/BOOL/char 等
         if name in ("NULL", "nil", "0"):
             continue
+        # 标识符紧跟 '(' → 是函数名，不是 ObjC 对象变量
+        tail = l[m.end():m.end() + 1]
+        if tail == "(":
+            continue
+        # 项目内所有 ObjC 变量都用驼峰小写开头；C 标量/常量全大写或全小写单词
         _ARC_BAD.append("第 %d 行: 裸转 C 指针需 __bridge | %s" % (ln, l.strip()[:90]))
 chk("ObjC→C 指针转换均带 __bridge", not _ARC_BAD,
     ("\n           ".join(_ARC_BAD)) if _ARC_BAD else "")
@@ -330,6 +340,29 @@ for name, (ln, l) in sorted(_g_first.items()):
 chk("g* 全局量均先定义", not _g_undef,
     ("\n           ".join(_g_undef)) if _g_undef else
     "共 %d 个：%s" % (len(_g_first), ",".join(sorted(_g_first))))
+
+print("\n[A12] 日志通道依赖")
+# 诊断版靠 dladdr 反推 jbroot 落盘。缺 dlfcn.h 会报 Dl_info 未定义；
+# 缺 dladdr 则整个文件通道静默失效（编译能过，运行期永远 nil）——最难查的一种。
+_LOGDEP = [
+    ("<dlfcn.h> 已导入",        lambda s: "#import <dlfcn.h>" in s or "#include <dlfcn.h>" in s),
+    ("dladdr 调用存在",         lambda s: "dladdr(" in s),
+    ("SVPNLogFilePath 定义",    lambda s: "static NSString *SVPNLogFilePath(void)" in s),
+    ("SVPNAppendToFile 定义",   lambda s: "static void SVPNAppendToFile(NSString *line)" in s),
+    ("SVPNLog 宏定义",          lambda s: "#define SVPNLog(" in s),
+]
+_src_all = "\n".join(lines)
+_missing = [n for n, f in _LOGDEP if not f(_src_all)]
+chk("日志通道依赖齐全", not _missing,
+    ("缺失：".join(_missing)) if _missing else "5/5 齐全")
+
+# 落盘函数的定义必须在宏之前：C 宏展开时函数要先有声明过
+_idx_append = _src_all.find("static void SVPNAppendToFile")
+_idx_macro = _src_all.find("#define SVPNLog(")
+chk("SVPNAppendToFile 定义在 SVPNLog 之前",
+    _idx_append >= 0 and _idx_macro > _idx_append,
+    "" if (_idx_append >= 0 and _idx_macro > _idx_append)
+    else "append=%d macro=%d（宏内调用会得到隐式声明）" % (_idx_append, _idx_macro))
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
