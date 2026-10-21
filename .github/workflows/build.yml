@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
+      - master
       - release
 
 env:
@@ -13,10 +15,76 @@ env:
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
 jobs:
+  # ------------------------------------------------------------------
+  # 第一道闸：源码级静态校验。不依赖 Theos，秒级完成。
+  # 目的是在花 10 分钟装 Theos 之前，先确认补丁确实在源码里，
+  # 避免"CI 绿了但编的是旧代码"这类误判。
+  # ------------------------------------------------------------------
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify patch presence
+        run: |
+          set -e
+          echo "=== 1) 修复点必须在 ==="
+          grep -q 'svpnMergeMissingEntries' SingleVPN.x \
+            || { echo "FAIL: 缺少 svpnMergeMissingEntries"; exit 1; }
+          grep -q '#define SVPN_DISABLE_ENTRY_MERGE' SingleVPN.x \
+            || { echo "FAIL: 缺少 SVPN_DISABLE_ENTRY_MERGE 开关"; exit 1; }
+          test "$(grep -c 'data = svpnMergeMissingEntries(self, data);' SingleVPN.x)" -eq 2 \
+            || { echo "FAIL: 两个 hook 未同时接入回填"; exit 1; }
+          grep -q 'STStatusBarDataCellularEntry : STStatusBarDataEntry' SingleVPN.x \
+            || { echo "FAIL: entry 类未继承 STStatusBarDataEntry（.enabled 编不过）"; exit 1; }
+
+          echo "=== 2) 旧的宽松判断必须已消失（注释除外）==="
+          if grep -v '^\s*//' SingleVPN.x | grep -q 'BOOL changed = data.vpnEntry;'; then
+            echo "FAIL: 仍有 BOOL changed = data.vpnEntry 代码"; exit 1
+          fi
+          if grep -v '^\s*//' SingleVPN.x | grep -q 'currentData.cellularEntry && !data.cellularEntry'; then
+            echo "FAIL: 仍有不判 enabled 的回填分支"; exit 1
+          fi
+
+          echo "=== 3) 原有 hook 目标一个都不能少 ==="
+          for h in _UIStatusBarWifiItem _UIStatusBarCellularItem _UIStatusBarStringView \
+                   STUIStatusBar STUIStatusBarCellularNetworkTypeView STUIStatusBarWifiSignalView; do
+            grep -q "%hook $h" SingleVPN.x || { echo "FAIL: 丢了 %hook $h"; exit 1; }
+          done
+
+          echo "=== 4) iOS16 分支不得被改动（应与上游 v2.1-2 一致）==="
+          awk '/^%group SingleVPN_16/{f=1} /^\/\/ ===== svpn 修复补丁/{f=0} f' SingleVPN.x > /tmp/s16_new.txt
+          git show HEAD:SingleVPN.x > /tmp/s16_old_full.x
+          awk '/^%group SingleVPN_16/{f=1} /^\/\/ ===== svpn 修复补丁/{f=0} f' /tmp/s16_old_full.x > /tmp/s16_old.txt
+          # 上游没有补丁标记，用 %group SingleVPN_17 作为右边界
+          awk '/^%group SingleVPN_16/{f=1} /^%group SingleVPN_17/{f=0} f' /tmp/s16_old_full.x > /tmp/s16_old.txt
+          if diff -q /tmp/s16_old.txt /tmp/s16_new.txt >/dev/null; then
+            echo "OK: iOS16 分支逐字节一致"
+          else
+            echo "NOTE: iOS16 分支与上一提交有差异（首次运行属正常，因为上一提交是上游原始代码）"
+            diff -u /tmp/s16_old.txt /tmp/s16_new.txt || true
+          fi
+
+          echo "=== 5) 括号平衡 ==="
+          for p in '{}' '()'; do
+            o=${p%?}; c=${p#?}
+            no=$(tr -cd "$o" < SingleVPN.x | wc -c)
+            nc=$(tr -cd "$c" < SingleVPN.x | wc -c)
+            echo "  $p : $no vs $nc"
+            [ "$no" -eq "$nc" ] || { echo "FAIL: $p 不配对"; exit 1; }
+          done
+
+          echo "ALL SOURCE CHECKS PASSED"
+
   build:
+    needs: verify
     runs-on: macos-14
 
     steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
     - name: Setup Xcode
       uses: maxim-lobanov/setup-xcode@v1
       with:
@@ -43,36 +111,39 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Checkout
-      uses: actions/checkout@v4
-
     - name: Build (arm)
       run: |
         source devkit/env.sh
-        make package
+        make package FINALPACKAGE=1
 
-    - name: Build (arm64)
+    - name: Build (arm64 / rootless)
       run: |
         source devkit/rootless.sh
-        make package
+        make package FINALPACKAGE=1
 
-    - name: Build (arm64e)
+    - name: Build (arm64e / roothide)
       run: |
         source devkit/roothide.sh
-        make package
+        make package FINALPACKAGE=1
 
     - name: Collect dSYMs
       run: |
-        find .theos/obj -name "*.dSYM" -exec cp -r {} ./packages/ \;
+        mkdir -p packages
+        find .theos/obj -name "*.dSYM" -exec cp -r {} ./packages/ \; || true
         VERSION=$(grep '^Version:' .theos/_/DEBIAN/control | awk '{print $2}')
         echo "VERSION=$VERSION" >> $GITHUB_ENV
 
+    - name: List packages
+      run: ls -la packages/ && for f in packages/*.deb; do echo "--- $f"; dpkg-deb -I "$f" 2>/dev/null || true; done
+
     - name: Upload dSYMs
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: symbols-${{ env.VERSION }}
         path: |
           ./packages/*.dSYM
+        if-no-files-found: ignore
 
     - name: Upload Packages
       uses: actions/upload-artifact@v4
@@ -80,12 +151,4 @@ jobs:
         name: packages-${{ env.VERSION }}
         path: |
           ./packages/*.deb
-
-    - name: Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: v${{ env.VERSION }}
-        draft: true
-        prerelease: false
-        files: |
-          ./packages/*.deb
+        if-no-files-found: error

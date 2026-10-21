@@ -14,10 +14,10 @@
 @property (getter=isEnabled, nonatomic, readonly) bool enabled;
 @end
 
-@interface STStatusBarDataCellularEntry : NSObject
+@interface STStatusBarDataCellularEntry : STStatusBarDataEntry
 @end
 
-@interface STStatusBarDataWifiEntry : NSObject
+@interface STStatusBarDataWifiEntry : STStatusBarDataEntry
 @end
 
 @interface STStatusBarData : NSObject
@@ -184,41 +184,72 @@ static void ReloadPrefs() {
 
 %end // SingleVPN_16
 
+// ===== svpn 修复补丁 =========================================================
+// 原版在 iOS 17 分支用「上一轮快照回填系统本轮没下发的 entry」来保住图标，
+// 有两个确定性缺陷：
+//   ① 用 `BOOL changed = data.vpnEntry` 当开关，判的是「vpnEntry 对象是否存在」，
+//      而不是「VPN 是否已连接」。iOS 17 的 STStatusBarData 里 _vpnEntry 是固定字段，
+//      该判断几乎恒真 —— 等于不管有没有连 VPN，每一帧都在替系统改写状态栏数据。
+//   ② 回填源 [self currentData] 是「已经渲染出去的上一轮数据」，可能是残缺的：
+//      respring 后蜂窝/WiFi 尚未重新上报时，系统会下发「存在但 enabled=NO」的空壳。
+//      原版只判 `!data.cellularEntry`（完全缺失），不判 enabled，
+//      于是把 disabled 空壳顶回去 —— 状态栏拿到一个「存在但不该显示」的 entry，
+//      主屏的信号条和 WiFi 图标就此消失；而 App 内状态栏重新上报后自行恢复。
+// 修复：只在 VPN 确实连接时才介入，且只回填「本身 enabled」的旧 entry。
+// 把下面的宏改成 1 可完全关闭回填，用于 A/B 验证。
+#define SVPN_DISABLE_ENTRY_MERGE 0
+
+static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarData *data) {
+    if (!data) {
+        return data;
+    }
+
+    STStatusBarData *cur = nil;
+    @try {
+        cur = [bar currentData];
+    } @catch (NSException *e) {
+        return data;
+    }
+    if (!cur) {
+        return data;
+    }
+
+    if (!data.cellularEntry && cur.cellularEntry.enabled) {
+        data = [data dataByReplacingEntry:[cur.cellularEntry copy] forKey:@"cellularEntry"];
+    }
+    if (!data.secondaryCellularEntry && cur.secondaryCellularEntry.enabled) {
+        data = [data dataByReplacingEntry:[cur.secondaryCellularEntry copy] forKey:@"secondaryCellularEntry"];
+    }
+    if (!data.wifiEntry && cur.wifiEntry.enabled) {
+        data = [data dataByReplacingEntry:[cur.wifiEntry copy] forKey:@"wifiEntry"];
+    }
+    return data;
+}
+// ============================================================================
+
 %group SingleVPN_17
 
 %hook STUIStatusBar
 
 - (void)_updateWithAggregatedData:(STStatusBarData *)data {
-    BOOL changed = data.vpnEntry;
     STStatusBarData *currentData = [self currentData];
-    if (changed && currentData.cellularEntry && !data.cellularEntry) {
-        data = [data dataByReplacingEntry:[currentData.cellularEntry copy] forKey:@"cellularEntry"];
-    }
-    if (changed && currentData.secondaryCellularEntry && !data.secondaryCellularEntry) {
-        data = [data dataByReplacingEntry:[currentData.secondaryCellularEntry copy] forKey:@"secondaryCellularEntry"];
-    }
-    if (changed && currentData.wifiEntry && !data.wifiEntry) {
-        data = [data dataByReplacingEntry:[currentData.wifiEntry copy] forKey:@"wifiEntry"];
+    _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+
+    if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
+        data = svpnMergeMissingEntries(self, data);
     }
 
-    _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
     %orig;
 }
 
 - (void)_updateWithData:(STStatusBarData *)data completionHandler:(id)a4 {
-    BOOL changed = data.vpnEntry;
     STStatusBarData *currentData = [self currentData];
-    if (changed && currentData.cellularEntry && !data.cellularEntry) {
-        data = [data dataByReplacingEntry:[currentData.cellularEntry copy] forKey:@"cellularEntry"];
-    }
-    if (changed && currentData.secondaryCellularEntry && !data.secondaryCellularEntry) {
-        data = [data dataByReplacingEntry:[currentData.secondaryCellularEntry copy] forKey:@"secondaryCellularEntry"];
-    }
-    if (changed && currentData.wifiEntry && !data.wifiEntry) {
-        data = [data dataByReplacingEntry:[currentData.wifiEntry copy] forKey:@"wifiEntry"];
+    _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+
+    if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
+        data = svpnMergeMissingEntries(self, data);
     }
 
-    _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
     %orig;
 }
 
@@ -227,7 +258,7 @@ static void ReloadPrefs() {
 %hook STUIStatusBarCellularNetworkTypeView
 
 - (void)setText:(NSString *)text prefixLength:(NSInteger)prefixLength withStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs forType:(NSInteger)type animated:(BOOL)animated {
-    if (!IsNetworkTypeText(text) || !_isForce5GAEnabled) {
+    if (![text hasPrefix:@"5G"] || !_isForce5GAEnabled) {
         %orig;
         if (@available(iOS 16, *)) {
             if (_isForce5GAEnabled && !self.widthConstraint.active) {
@@ -267,7 +298,7 @@ static void ReloadPrefs() {
         }
 
         NSString *text = self.text;
-        if (!IsNetworkTypeText(text)) {
+        if (![text hasPrefix:@"5G"]) {
             return;
         }
 
