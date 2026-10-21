@@ -355,11 +355,16 @@ _LOGDEP = [
     ("SVPNLogFilePath 定义",    lambda s: "static NSString *SVPNLogFilePath(void)" in s),
     ("SVPNAppendToFile 定义",   lambda s: "static void SVPNAppendToFile(NSString *line)" in s),
     ("SVPNLog 宏定义",          lambda s: "#define SVPNLog(" in s),
+    # 第二通道：文件写不进去时的兜底，靠 cfprefsd
+    ("CoreFoundation 已导入",   lambda s: "CoreFoundation/CoreFoundation.h" in s),
+    ("CFPreferencesSetAppValue", lambda s: "CFPreferencesSetAppValue(" in s),
+    ("CFPreferencesAppSynchronize", lambda s: "CFPreferencesAppSynchronize(" in s),
+    ("SVPNPushToDefaults 定义", lambda s: "static void SVPNPushToDefaults(" in s),
 ]
 _src_all = "\n".join(lines)
 _missing = [n for n, f in _LOGDEP if not f(_src_all)]
 chk("日志通道依赖齐全", not _missing,
-    ("缺失：".join(_missing)) if _missing else "5/5 齐全")
+    ("缺失：".join(_missing)) if _missing else "%d/%d 齐全" % (len(_LOGDEP), len(_LOGDEP)))
 
 # 落盘函数的定义必须在宏之前：C 宏展开时函数要先有声明过
 _idx_append = _src_all.find("static void SVPNAppendToFile")
@@ -368,6 +373,25 @@ chk("SVPNAppendToFile 定义在 SVPNLog 之前",
     _idx_append >= 0 and _idx_macro > _idx_append,
     "" if (_idx_append >= 0 and _idx_macro > _idx_append)
     else "append=%d macro=%d（宏内调用会得到隐式声明）" % (_idx_append, _idx_macro))
+
+print("\n[A13] 脚本行尾（CRLF 会让 shell 直接报 command not found）")
+# 真实踩过：devkit/env.sh 是 CRLF，在 macOS runner 上执行报
+#   "devkit/env.sh: line 2: : command not found" + exit 127
+# 根因是 \r 被当成命令的一部分。git 通道提交会按 .gitattributes 规范化，
+# 但用 REST API 直推 blob 时不会 —— 所以必须在自检里卡住。
+_bad_eol = []
+for _root, _dirs, _fs in os.walk(_REPO):
+    if '.git' in _root or '.theos' in _root or 'packages' in _root:
+        continue
+    for _f in _fs:
+        if not _f.endswith('.sh'):
+            continue
+        _p = os.path.join(_root, _f)
+        _b = open(_p, 'rb').read()
+        if b'\r\n' in _b:
+            _bad_eol.append(os.path.relpath(_p, _REPO))
+chk("所有 .sh 均为 LF 行尾", not _bad_eol,
+    ("CRLF: " + ", ".join(_bad_eol)) if _bad_eol else "全部 LF")
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

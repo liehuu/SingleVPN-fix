@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <time.h>          // clock_gettime / CLOCK_MONOTONIC（心跳节流用）
+#import <CoreFoundation/CoreFoundation.h>   // CFPreferences*（第二日志通道）
 
 #import "Common.h"
 #import "UIColor+.h"
@@ -198,7 +199,24 @@ static void ReloadPrefs() {
 //      主屏的信号条和 WiFi 图标就此消失；而 App 内状态栏重新上报后自行恢复。
 // 修复：只在 VPN 确实连接时才介入，且只回填「本身 enabled」的旧 entry。
 // 把下面的宏改成 1 可完全关闭回填，用于 A/B 验证。
-#define SVPN_DISABLE_ENTRY_MERGE 0
+//
+// ★★ v2.1-6：默认改为 1（关闭回填）。
+// 用户实测结论（决定性证据）：
+//   ① 图标消失只在 respring 之后出现，不是运行中逐渐变坏
+//      → 属一次性初始化阶段的问题，不是"用久了状态漂移"
+//   ② 完全卸载插件后，反复 respring 都不再消失
+//      → 确认是插件引起的
+//   ③ 消失形态是"整块空白，跟普通空白一样"
+//      → 不是颜色问题（背景同色至少能看出轮廓），是 entry 被判定为不该显示
+//
+// 结合①：respring 瞬间 currentData 是上一轮的陈旧快照，enabled 可能仍为 YES，
+// 但 string / signalStrength 等字段是残缺的。加 enabled 守卫拦不住这种
+// "enabled=YES 但内容残缺"的壳 —— 塞回系统后它照样画不出来，表现就是整块空白。
+// 因此正确做法不是"回填得更小心"，而是**根本不要回填**：
+// 系统本来就会在稍后重新上报完整数据，我们插手只会把残缺数据顶进渲染管线。
+//
+// 染色功能与此无关，保持开启。
+#define SVPN_DISABLE_ENTRY_MERGE 1
 
 static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarData *data) {
     if (!data) {
@@ -405,9 +423,20 @@ static NSString *SVPNLogFilePath(void) {
     @try {
         NSMutableArray *dirs = [NSMutableArray array];
 
-        // 候选 1：从自身 dylib 路径回溯 jbroot，再拼 var/mobile/Library/Logs
-        // 普通版：/Library/MobileSubstrate/DynamicLibraries/x.dylib  → 回溯 4 级得 "/"
-        // RootHide：<jbroot>/Library/MobileSubstrate/DynamicLibraries/x.dylib → 得 <jbroot>
+        // ★ 候选顺序按「在 SpringBoard 里越可能可写」排，而不是按「越标准」排。
+        //
+        // 实测教训：上一版只放 /var/mobile/Library/Logs/... 和 jbroot 下两条，
+        // 用户机上**连目录都建不出来**（整个 SingleVPN 文件夹不存在）。
+        // 说明 RootHide 环境下 SpringBoard 对 /var/mobile/Library 没有创建权限。
+        //
+        // 关键洞察：tweak 的配置 plist 一直写在
+        //   /var/mobile/Library/Preferences/
+        // 并且一直是成功的（插件能读到开关）。这条路径**已被证明可写**，
+        // 所以优先用它。日志文件名带自己的前缀，不与配置冲突。
+        NSString *prefsDir = @"/var/mobile/Library/Preferences";
+        [dirs addObject:prefsDir];
+
+        // 其次：jbroot 内 Library/Logs（RootHide 下这个根通常可写）
         Dl_info info;
         if (dladdr((const void *)SVPNLogFilePath, &info) && info.dli_fname) {
             NSString *selfPath = [NSString stringWithUTF8String:info.dli_fname];
@@ -416,13 +445,15 @@ static NSString *SVPNLogFilePath(void) {
                 p2 = [p2 stringByDeletingLastPathComponent];
             }
             if (p2.length > 1) {
-                [dirs addObject:[p2 stringByAppendingPathComponent:@"var/mobile/Library/Logs/SingleVPN"]];
+                [dirs addObject:[p2 stringByAppendingPathComponent:@"var/mobile/Library/Preferences"]];
+                [dirs addObject:[p2 stringByAppendingPathComponent:@"Library/Logs"]];
             }
         }
 
-        // 候选 2/3：RootHide 常见硬编码根（与用户机实际 jbroot 前缀一致）
-        [dirs addObject:@"/var/mobile/Library/Logs/SingleVPN"];
-        [dirs addObject:@"/var/jb/var/mobile/Library/Logs/SingleVPN"];
+        // 兜底：常见 RootHide 根与标准日志目录
+        [dirs addObject:@"/var/mobile/Library/Logs"];
+        [dirs addObject:@"/var/jb/var/mobile/Library/Logs"];
+        [dirs addObject:@"/tmp"];
 
         NSFileManager *fm = [NSFileManager defaultManager];
         for (NSString *dir in dirs) {
@@ -432,11 +463,14 @@ static NSString *SVPNLogFilePath(void) {
             if (![fm fileExistsAtPath:dir]) {
                 continue;   // 建不出来，换下一个
             }
-            NSString *probe = [dir stringByAppendingPathComponent:@".probe"];
+            // 用真实文件名探测，而不是 .probe：万一 .probe 被沙盒特判，
+            // 至少能确认「这个目录能写我自己的文件」。
+            NSString *target = [dir stringByAppendingPathComponent:@"SingleVPN-svpn.log"];
             NSData *d = [@"1" dataUsingEncoding:NSUTF8StringEncoding];
-            if ([d writeToFile:probe atomically:NO]) {
-                [fm removeItemAtPath:probe error:NULL];
-                cached = [dir stringByAppendingPathComponent:@"svpn.log"];
+            if ([d writeToFile:target atomically:NO]) {
+                // 探测成功，把探测内容清掉，之后正常追加
+                [fm removeItemAtPath:target error:NULL];
+                cached = target;
                 break;
             }
         }
@@ -450,11 +484,49 @@ static NSString *SVPNLogFilePath(void) {
     return cached;
 }
 
+/// ★ 第二通道：写进 NSUserDefaults（走 cfprefsd → plist）。
+/// 为什么需要：文件通道可能因沙盒被整条拒绝（已真实发生过一次，用户机上
+/// 连目录都建不出来）。而 tweak 的配置 plist 一直是能写的，
+/// 说明 cfprefsd 这条链路在 SpringBoard 里是可用的。
+/// 代价是每次写都要序列化，所以只保留最近 N 行，且按计数节流。
+static NSMutableArray *gDefaultsLines = nil;
+static NSUInteger gDefaultsWrites = 0;
+#define SVPN_DEFAULTS_MAX_LINES 40
+#define SVPN_DEFAULTS_MAX_WRITES 60   // 总写入次数上限，防止长期运行磨损 plist
+
+static void SVPNPushToDefaults(NSString *line) {
+    if (!line.length) return;
+    if (gDefaultsWrites >= SVPN_DEFAULTS_MAX_WRITES) return;
+    @try {
+        if (!gDefaultsLines) {
+            gDefaultsLines = [NSMutableArray array];
+        }
+        [gDefaultsLines addObject:line];
+        while ((NSUInteger)[gDefaultsLines count] > SVPN_DEFAULTS_MAX_LINES) {
+            [gDefaultsLines removeObjectAtIndex:0];
+        }
+        // 每 5 行刷一次，避免每行都触发一次 cfprefsd 往返
+        gDefaultsWrites++;
+        if (gDefaultsWrites % 5 != 0 && gDefaultsWrites < SVPN_DEFAULTS_MAX_WRITES) {
+            return;
+        }
+        NSArray *snap = [gDefaultsLines copy];
+        CFStringRef key = CFSTR("DiagLog");
+        CFStringRef app = CFSTR("com.82flex.singlevpn");
+        CFPreferencesSetAppValue(key, (__bridge CFPropertyListRef)snap, app);
+        CFPreferencesAppSynchronize(app);
+    } @catch (NSException *e) {
+        // 静默
+    }
+}
+
 /// 追加一行到文件（失败不报错，不影响宿主）
 static void SVPNAppendToFile(NSString *line) {
     @try {
         NSString *path = SVPNLogFilePath();
         if (!path || !line.length) {
+            // 文件通道不可用时，至少让内容进 plist
+            SVPNPushToDefaults(line);
             return;
         }
         NSString *text = [line stringByAppendingString:@"\n"];
@@ -469,6 +541,7 @@ static void SVPNAppendToFile(NSString *line) {
         }
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
         if (!fh) {
+            SVPNPushToDefaults(line);
             return;
         }
         @try {
@@ -478,7 +551,7 @@ static void SVPNAppendToFile(NSString *line) {
             [fh closeFile];
         }
     } @catch (NSException *e) {
-        // 静默
+        SVPNPushToDefaults(line);
     }
 }
 
@@ -815,7 +888,7 @@ static void SVPNLogData(NSString *tag, id data) {
 #if SVPN_DIAG
     // ★ 必须在 IsEnabled 判断之前打：否则「插件被关掉」时一条日志都没有，
     //   会被误判成「诊断版没装上」，白跑一轮。
-    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-5)");
+    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-6)");
     SVPNLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
     // 告诉用户日志落在哪：抓不到系统日志时可直接用 Filza 打开这个文件
     NSString *svpn_lp = SVPNLogFilePath();
