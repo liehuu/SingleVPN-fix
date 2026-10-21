@@ -41,14 +41,20 @@ echo "TRIPLE: $TRIPLE"
 LOGOS="$ROOT/vendor/logos/bin/logos.pl"
 [ -f "$LOGOS" ] || { echo "缺少 $LOGOS"; exit 1; }
 
-perl "$LOGOS" "$ROOT/SingleVPN.x" > "$BUILD/SingleVPN.mm"
-[ -s "$BUILD/SingleVPN.mm" ] || { echo "✗ Logos 预处理输出为空"; exit 1; }
-echo "Logos 预处理完成: $(wc -l < "$BUILD/SingleVPN.mm") 行"
+# ★ 产物必须放在**仓库根目录**，不能放 .build/：
+#   SingleVPN.x 里有 #import "Common.h" / "UIColor+.h"，这是相对路径，
+#   clang 的引号 include 只查「本文件所在目录」+ -I 列表。
+#   放 .build/ 会报 fatal error: 'Common.h' file not found（已踩过一次）。
+#   同时 -I "$ROOT" 双保险。
+GEN="$ROOT/_SingleVPN_gen.mm"
+perl "$LOGOS" "$ROOT/SingleVPN.x" > "$GEN"
+[ -s "$GEN" ] || { echo "✗ Logos 预处理输出为空"; exit 1; }
+echo "Logos 预处理完成: $(wc -l < "$GEN") 行"
 
 # 预处理产物里不应再有未展开的 %hook / %orig（有就是不认这个语法，会编译失败）
-if grep -qE '^\s*%hook|%orig' "$BUILD/SingleVPN.mm"; then
+if grep -qE '^\s*%hook|%orig' "$GEN"; then
   echo "✗ 预处理后仍有 %hook/%orig，Logos 未生效"
-  grep -nE '^\s*%hook|%orig' "$BUILD/SingleVPN.mm" | head -5
+  grep -nE '^\s*%hook|%orig' "$GEN" | head -5
   exit 1
 fi
 
@@ -56,10 +62,15 @@ fi
 # -undefined dynamic_lookup：MSHookMessageEx / STStatusBarData* 等私有符号
 # 留到运行时由 SpringBoard 解析，链接期不要求存在。
 # -fobjc-arc：源码使用 ARC。
+# ★ 必须加 -I "$ROOT"：
+#   预处理产物放在 .build/ 下，而源码里的 #import "Common.h" / "UIColor+.h"
+#   是相对源码目录的，不在 .build/ 里。clang 的引号 include 只查
+#   「包含本文件的目录」+ -I 列表，产物挪了目录就找不到。
 xcrun clang -target "$TRIPLE" -isysroot "$SDK" \
+  -I "$ROOT" \
   -dynamiclib -fobjc-arc -undefined dynamic_lookup -Wall \
   -framework Foundation -framework UIKit -framework CoreFoundation \
-  "$BUILD/SingleVPN.mm" "$ROOT/UIColor+.m" \
+  "$GEN" "$ROOT/UIColor+.m" \
   -o "$BUILD/SingleVPN.dylib" \
   -Xlinker -install_name -Xlinker \
     "@loader_path/.jbroot/Library/MobileSubstrate/DynamicLibraries/SingleVPN.dylib"

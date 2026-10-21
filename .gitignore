@@ -139,3 +139,5 @@ iOSInjectionProject/
 
 # End of https://www.toptal.com/developers/gitignore/api/swift,macos,xcode
 n
+# Logos 预处理中间产物（放在仓库根以便 #import "x.h" 相对路径生效）
+_SingleVPN_gen.mm
