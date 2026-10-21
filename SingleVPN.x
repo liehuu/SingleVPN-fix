@@ -231,9 +231,12 @@ static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarD
 // 目的：不再靠读源码猜。把「每次下发到状态栏的数据到底长什么样」记下来，
 //       以及「我们到底改没改它」，一次性搞清楚图标消失时是谁的问题。
 //
-// 输出：NSLog，前缀 [SVPN]。不写文件 —— RootHide 的 jbroot 在
-//       AppGroup 随机哈希目录里，SpringBoard 无该容器访问权（CellularTint 踩过），
-//       所以文件方案不可靠；NSLog 由系统统一收口，最省事也最不会失手。
+// 输出：双通道，前缀 [SVPN]
+//   ① NSLog —— 系统统一日志服务，可用 log stream/show 抓
+//   ② 文件 —— <jbroot>/var/mobile/Library/Logs/SingleVPN/svpn.log，
+//      用 Filza 直接打开。RootHide 的 jbroot 在 AppGroup 随机哈希目录，
+//      无法硬编码，所以用 dladdr 反推自身路径（CellularTint 验证过可行）。
+//   两条都写，任一条能取到就够。
 //
 // 用法：安装后 respring 几次，复现后把日志导出来看。
 // 判定要点见每条记录里的 isNil / isEn 字段。
@@ -340,12 +343,121 @@ static NSString *SVPNColorDesc(UIColor *c) {
                     (int)lround(b * 255), (int)lround(a * 255)];
 }
 
+// ---- 落盘通道（NSLog 抓不到时的兜底）------------------------------------
+// 为什么两路都做：NSLog 走系统的统一日志服务，需要从电脑或终端去捞，
+// 多一道手续；而 dylib 自己就躺在 <jbroot>/Library/MobileSubstrate/DynamicLibraries/，
+// 用 dladdr 反推 jbroot 后直接写文件，用户用 Filza 就能打开看。
+// 这条路 CellularTint 验证过可用（见该项目 main.m 的 CTResolveJbroot）。
+//
+// 安全约束（注入 SpringBoard，任何异常都不能外泄）：
+//   * 只写固定路径、固定文件名，不做任何拼接扫描
+//   * 无上限行数控制由调用方 gDiagCount 决定（最多 120 条）
+//   * 全程 @try/@catch，失败静默降级为「只有 NSLog」
+//   * 用 appendFile 而不是自己 fopen/写/关，交给 Foundation 管
+static NSString *SVPNLogFilePath(void) {
+    // 注意：这里不能用 dispatch_once —— 若首次反推 jbroot 失败，
+    // once 已被消耗，之后再也不会重试，整个诊断通道就永久哑掉。
+    // 改用一个普通标记：成功后才锁定。
+    static NSString *cached = nil;
+    static NSString *failed = nil;   // 只要失败过就不再重试，避免每次打日志都去 IO
+    if (cached || failed) {
+        return cached;
+    }
+    @try {
+        NSMutableArray *dirs = [NSMutableArray array];
+
+        // 候选 1：从自身 dylib 路径回溯 jbroot，再拼 var/mobile/Library/Logs
+        // 普通版：/Library/MobileSubstrate/DynamicLibraries/x.dylib  → 回溯 4 级得 "/"
+        // RootHide：<jbroot>/Library/MobileSubstrate/DynamicLibraries/x.dylib → 得 <jbroot>
+        Dl_info info;
+        if (dladdr((const void *)SVPNLogFilePath, &info) && info.dli_fname) {
+            NSString *selfPath = [NSString stringWithUTF8String:info.dli_fname];
+            NSString *p2 = selfPath;
+            for (int i = 0; i < 4 && p2.length > 1; i++) {
+                p2 = [p2 stringByDeletingLastPathComponent];
+            }
+            if (p2.length > 1) {
+                [dirs addObject:[p2 stringByAppendingPathComponent:@"var/mobile/Library/Logs/SingleVPN"]];
+            }
+        }
+
+        // 候选 2/3：RootHide 常见硬编码根（与用户机实际 jbroot 前缀一致）
+        [dirs addObject:@"/var/mobile/Library/Logs/SingleVPN"];
+        [dirs addObject:@"/var/jb/var/mobile/Library/Logs/SingleVPN"];
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *dir in dirs) {
+            if (![fm fileExistsAtPath:dir]) {
+                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+            }
+            if (![fm fileExistsAtPath:dir]) {
+                continue;   // 建不出来，换下一个
+            }
+            NSString *probe = [dir stringByAppendingPathComponent:@".probe"];
+            NSData *d = [@"1" dataUsingEncoding:NSUTF8StringEncoding];
+            if ([d writeToFile:probe atomically:NO]) {
+                [fm removeItemAtPath:probe error:NULL];
+                cached = [dir stringByAppendingPathComponent:@"svpn.log"];
+                break;
+            }
+        }
+        if (!cached) {
+            failed = @"1";
+        }
+    } @catch (NSException *e) {
+        failed = @"1";
+        cached = nil;
+    }
+    return cached;
+}
+
+/// 追加一行到文件（失败不报错，不影响宿主）
+static void SVPNAppendToFile(NSString *line) {
+    @try {
+        NSString *path = SVPNLogFilePath();
+        if (!path || !line.length) {
+            return;
+        }
+        NSString *text = [line stringByAppendingString:@"\n"];
+        NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+        if (!data) {
+            return;
+        }
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) {
+            [data writeToFile:path atomically:NO];
+            return;
+        }
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            return;
+        }
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:data];
+        } @finally {
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {
+        // 静默
+    }
+}
+
+/// 统一输出入口：NSLog（便于用 log 命令抓）+ 文件（便于 Filza 直接看）
+// 刻意「不声明任何局部变量」——本宏有调用点位于 @catch 块内，
+// @catch 对跨初始化的局部声明有额外限制，少一个变量少一分编译失败风险。
+#define SVPNLog(fmt, ...) do { \
+    NSLog(fmt, ##__VA_ARGS__); \
+    SVPNAppendToFile([NSString stringWithFormat:fmt, ##__VA_ARGS__]); \
+} while (0)
+
 /// 一次性打印一条 STStatusBarData 的全貌
 static void SVPNLogData(NSString *tag, id data) {
     if (!data) {
-        NSLog(@"[SVPN] %@ data=nil", tag);
+        SVPNLog(@"[SVPN] %@ data=nil", tag);
         return;
     }
+
 
     NSMutableString *s = [NSMutableString stringWithFormat:@"[SVPN] %@ {", tag];
     @try {
@@ -375,7 +487,7 @@ static void SVPNLogData(NSString *tag, id data) {
         [s appendFormat:@" <exception %@>", e.reason];
     }
     [s appendString:@"}"];
-    NSLog(@"%@", s);
+    SVPNLog(@"%@", s);
 }
 
 #endif
@@ -401,7 +513,7 @@ static void SVPNLogData(NSString *tag, id data) {
             gLastLoggedData = (__bridge const void *)data;
             gDiagCount++;
             gDiagSeq = gDiagCount;
-            NSLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
+            SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
                   (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
             SVPNLogData(@"AGG  in ", data);
             SVPNLogData(@"AGG  cur", currentData);
@@ -435,7 +547,7 @@ static void SVPNLogData(NSString *tag, id data) {
             gLastLoggedData = (__bridge const void *)data;
             gDiagCount++;
             gDiagSeq = gDiagCount;
-            NSLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
+            SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
                   (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
             SVPNLogData(@"UPD  in ", data);
             SVPNLogData(@"UPD  cur", currentData);
@@ -573,7 +685,7 @@ static void SVPNLogData(NSString *tag, id data) {
     if ((!activeColor || gColorDiagCount < 40) && gDiagCount < gDiagMax) {
         gDiagCount++;
         gColorDiagCount++;
-        NSLog(@"[SVPN] #%lu WIFI setActiveColor in=%@ tint=%d out=%@ self=%@",
+        SVPNLog(@"[SVPN] #%lu WIFI setActiveColor in=%@ tint=%d out=%@ self=%@",
               (unsigned long)gDiagCount, SVPNColorDesc(activeColor), (int)decision,
               SVPNColorDesc(decision ? svpnColorWithTextColor(activeColor) : activeColor),
               NSStringFromClass([self class]));
@@ -607,7 +719,7 @@ static void SVPNLogData(NSString *tag, id data) {
         gStyleDiagCount++;
         UIColor *inColor = nil;
         @try { inColor = styleAttrs.textColor; } @catch (NSException *e) {}
-        NSLog(@"[SVPN] #%lu STYLE in=%@ tint=%d out=%@ self=%@",
+        SVPNLog(@"[SVPN] #%lu STYLE in=%@ tint=%d out=%@ self=%@",
               (unsigned long)gDiagCount, SVPNColorDesc(inColor), (int)decision,
               SVPNColorDesc(decision ? svpnColorWithTextColor(inColor) : inColor),
               NSStringFromClass([self class]));
@@ -634,13 +746,16 @@ static void SVPNLogData(NSString *tag, id data) {
 #if SVPN_DIAG
     // ★ 必须在 IsEnabled 判断之前打：否则「插件被关掉」时一条日志都没有，
     //   会被误判成「诊断版没装上」，白跑一轮。
-    NSLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-5)");
-    NSLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
+    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-5)");
+    SVPNLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
+    // 告诉用户日志落在哪：抓不到系统日志时可直接用 Filza 打开这个文件
+    NSString *svpn_lp = SVPNLogFilePath();
+    SVPNLog(@"[SVPN] logfile=%@", svpn_lp ? svpn_lp : @"(写入失败，只能看系统日志)");
 #endif
 
     if (!_isEnabled) {
 #if SVPN_DIAG
-        NSLog(@"[SVPN] ==== ctor exit: plugin disabled in prefs, no hooks ====");
+        SVPNLog(@"[SVPN] ==== ctor exit: plugin disabled in prefs, no hooks ====");
 #endif
         return;
     }
@@ -648,8 +763,8 @@ static void SVPNLogData(NSString *tag, id data) {
 #if SVPN_DIAG
     // 启动快照：先确认「我们以为 hook 到的类」真的存在。
     // 若某个类是 Nil，那套 hook 就是空转 —— 所有基于它的推理全部失效。
-    NSLog(@"[SVPN] ==== ctor begin ====");
-    NSLog(@"[SVPN] prefs IsEnabled=%d Rev=%d Force5GA=%d light=%@ dark=%@",
+    SVPNLog(@"[SVPN] ==== ctor begin ====");
+    SVPNLog(@"[SVPN] prefs IsEnabled=%d Rev=%d Force5GA=%d light=%@ dark=%@",
           (int)_isEnabled, (int)_isEnabledReversed, (int)_isForce5GAEnabled,
           SVPNColorDesc(_lightReplacementColor), SVPNColorDesc(_darkReplacementColor));
 
@@ -676,11 +791,11 @@ static void SVPNLogData(NSString *tag, id data) {
         @try { labelC = [UIColor labelColor]; } @catch (NSException *e) {}
         BOOL dark = NO;
         @try { dark = [labelC svpn_isDarkColor]; } @catch (NSException *e) {}
-        NSLog(@"[SVPN] appearance=%@ labelColor=%@ isDark=%d => pick=%@",
+        SVPNLog(@"[SVPN] appearance=%@ labelColor=%@ isDark=%d => pick=%@",
               style, SVPNColorDesc(labelC), (int)dark,
               SVPNColorDesc(svpnColorWithTextColor(labelC)));
     } @catch (NSException *e) {
-        NSLog(@"[SVPN] appearance probe failed: %@", e.reason);
+        SVPNLog(@"[SVPN] appearance probe failed: %@", e.reason);
     }
     NSArray *cls = @[@"STUIStatusBar", @"STUIStatusBarCellularNetworkTypeView",
                      @"STUIStatusBarStringView", @"STUIStatusBarWifiSignalView",
@@ -688,7 +803,7 @@ static void SVPNLogData(NSString *tag, id data) {
                      @"STUIStatusBarDualCellularSignalView"];
     for (NSString *n in cls) {
         Class c = NSClassFromString(n);
-        NSLog(@"[SVPN] class %@ = %@", n, c ? @"FOUND" : @"NIL");
+        SVPNLog(@"[SVPN] class %@ = %@", n, c ? @"FOUND" : @"NIL");
     }
 
     // ★ 私有 API 存在性探测：这几处在染色路径上被直接调用，
@@ -706,14 +821,14 @@ static void SVPNLogData(NSString *tag, id data) {
                 BOOL inst = [sc instancesRespondToSelector:NSSelectorFromString(s)];
                 [(inst ? have : miss) addObject:s];
             }
-            NSLog(@"[SVPN] StyleAttributes SUPPORTED=%@ MISSING=%@", have, miss);
+            SVPNLog(@"[SVPN] StyleAttributes SUPPORTED=%@ MISSING=%@", have, miss);
         } else {
-            NSLog(@"[SVPN] StyleAttributes = NIL");
+            SVPNLog(@"[SVPN] StyleAttributes = NIL");
         }
     } @catch (NSException *e) {
-        NSLog(@"[SVPN] selector probe failed: %@", e.reason);
+        SVPNLog(@"[SVPN] selector probe failed: %@", e.reason);
     }
-    NSLog(@"[SVPN] ==== ctor end ====");
+    SVPNLog(@"[SVPN] ==== ctor end ====");
 #endif
 
     CFNotificationCenterAddObserver(
