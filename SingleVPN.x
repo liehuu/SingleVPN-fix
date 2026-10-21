@@ -1,4 +1,8 @@
-#import <HBLog.h>
+// ★ 不要 import <HBLog.h> / <substrate.h> 等 Theos 私有头：
+//   它们由 Theos 的 lib 目录提供，本工程已改为「零 Theos」构建
+//   （xcrun clang 直编 + vendored logos.pl），编不到。
+//   原文件只有一行 #import <HBLog.h>，全文没有任何 HBLog() 调用，直接删除。
+//   需要 hook 运行时符号时，用 -undefined dynamic_lookup 让 SpringBoard 在运行时解析。
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <time.h>          // clock_gettime / CLOCK_MONOTONIC（心跳节流用）

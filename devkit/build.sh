@@ -65,9 +65,13 @@ xcrun clang -target "$TRIPLE" -isysroot "$SDK" \
     "@loader_path/.jbroot/Library/MobileSubstrate/DynamicLibraries/SingleVPN.dylib"
 
 # ---------- 3) 编译 PreferenceBundle ----------
-# 私有 Preferences.framework 用仓库内自备的 tbd（官方 SDK 里没有）
+# 私有 Preferences.framework：
+#   · 头文件用仓库自带的 vendor/Preferences-shim（Theos 那套头不可用了）
+#   · 链接用仓库自带的 SingleVPNPrefs/Frameworks/Preferences.tbd
+#   · 符号本身走 -undefined dynamic_lookup，运行时由设置 App 解析
 xcrun clang -target "$TRIPLE" -isysroot "$SDK" \
   -dynamiclib -fobjc-arc -undefined dynamic_lookup -Wall \
+  -I "$ROOT/vendor/Preferences-shim" \
   -framework Foundation -framework UIKit -framework CoreFoundation \
   -F "$ROOT/SingleVPNPrefs/Frameworks" -framework Preferences \
   "$ROOT/SingleVPNPrefs/SingleVPNRootListController.m" \
