@@ -207,18 +207,38 @@ blob = out.getvalue()
 #   unsupported PAX tar header type 'x'
 #   W: Unknown TAR header type 120
 #   E: Sub-process /usr/bin/dpkg returned an error code (1)
-# 这条闸门直接扫 512 字节对齐块的 typeflag，比解包再检查更贴近 dpkg 的读法。
+#
+# ★ 必须按 tar 的真实结构走：读一个头(512B) → 按 size 字段跳过数据区(按 512 对齐)
+#   → 再读下一个头。不能每 512 字节盲扫！
+#   第一次实现就是盲扫，结果在 CI 上报了**假警报**：dylib 是二进制，
+#   其中某 512 字节块的偏移 156 处恰好是 'x'（ASCII 120），被当成 PAX 头。
+#   报出来的"文件名"是 `8_logos_superclass$SingleVPN_17$STUIStatusBar...`
+#   —— 一看就是引用的符号名，不是 tar 路径，即假阳性。
+#   盲扫的误报率与「载荷里二进制字节的分布」相关，等于不可用。
+#
 # ★ 只拦 PAX 系的 'x'（per-file 扩展头）与 'g'（global 扩展头）：
 #   dpkg 报的正是 "unsupported PAX tar header type 'x'"。
 #   不拦 GNU 的 'L'（@LongLink）：那是规范内的长文件名机制，dpkg 认。
 #   实测：路径 <100 字符时连 'L' 都不会出现（本项目最长 81 字符）。
 def _check_no_pax_headers(raw, label):
     bad = []
-    for off in range(0, len(raw) - 512, 512):
-        tf = raw[off + 156:off + 157]
+    off = 0
+    n = len(raw)
+    while off + 512 <= n:
+        blk = raw[off:off + 512]
+        if blk == b'\x00' * 512:      # 结尾的零块
+            break
+        tf = blk[156:157]
+        size_f = blk[124:136].rstrip(b'\x00 ').decode('ascii', 'replace')
+        try:
+            size = int(size_f, 8) if size_f else 0
+        except ValueError:
+            size = 0
         if tf in (b'x', b'g'):
-            nm = raw[off:off + 100].rstrip(b'\x00').decode('ascii', 'replace')
+            nm = blk[0:100].rstrip(b'\x00').decode('ascii', 'replace')
             bad.append('%s@%d' % (nm, off))
+        # 跳到下一个头：头 512 + 数据区向上取整到 512
+        off += 512 + ((size + 511) // 512) * 512
     if bad:
         print('  ✗ %s 里有 %d 个 PAX 扩展头（dpkg 不认，装包必失败）:' % (label, len(bad)))
         for b in bad[:6]:
