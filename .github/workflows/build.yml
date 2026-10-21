@@ -98,9 +98,18 @@ jobs:
     - name: Resolve Theos commit (cache key)
       id: theos_rev
       run: |
-        set -e
-        T1=$(git ls-remote https://github.com/owngoal-dev/theos HEAD | cut -c1-12)
-        T2=$(git ls-remote https://github.com/owngoal-dev/theos-roothide HEAD | cut -c1-12)
+        set -euo pipefail
+        # ★ 这里不能用 `git ls-remote ... | cut -c1-12`：
+        #   ls-remote 失败时输出 "fatal: unable to access ..."，
+        #   cut 照样成功退出，set -e 拦不住，key 就变成 "theos-fatal: unabl-fatal: unabl"，
+        #   看着像"每次都不同所以总 miss"，实则是一个错误常量。
+        # 用 --help 之外的更稳妥写法：分别取，失败就回落到固定串。
+        rev() {
+          # 取不到就返回 "unknown"，保证 key 稳定可复用，而不是随机变化
+          git ls-remote --exit-code "$1" HEAD 2>/dev/null | awk 'NR==1{print substr($1,1,12)}' || echo unknown
+        }
+        T1=$(rev https://github.com/owngoal-dev/theos)
+        T2=$(rev https://github.com/owngoal-dev/theos-roothide)
         echo "theos=$T1 roothide=$T2"
         echo "key=theos-$T1-$T2" >> $GITHUB_OUTPUT
 

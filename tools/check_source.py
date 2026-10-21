@@ -393,6 +393,30 @@ for _root, _dirs, _fs in os.walk(_REPO):
 chk("所有 .sh 均为 LF 行尾", not _bad_eol,
     ("CRLF: " + ", ".join(_bad_eol)) if _bad_eol else "全部 LF")
 
+print("\n[A14] 脚本可执行位（644 在 runner 上 permission denied）")
+# 真实踩过：一次 git add -A 把 devkit/env.sh / roothide.sh / rootless.sh
+# 从 100755 降成 100644。Windows 侧 ls 看不出差别（一律显示 -rwxr-xr-x），
+# 只有 git 索引里的 mode 才作数；到 Linux runner 上就 permission denied。
+# 与 A13 属同一类：本地完全正常，跨平台才炸。
+_git_dir = os.path.join(_REPO, '.git')
+_mode_bad = []
+if os.path.isdir(_git_dir):
+    import subprocess
+    _r = subprocess.run(['git', 'ls-files', '-s', '*.sh'],
+                        cwd=_REPO, capture_output=True, text=True)
+    for _line in (_r.stdout or '').splitlines():
+        # 形如：100755 <sha> 0\tdevkit/env.sh
+        _parts = _line.split('\t')
+        if len(_parts) != 2:
+            continue
+        _mode = _parts[0].split()[0]
+        _path = _parts[1]
+        if _mode != '100755':
+            _mode_bad.append("%s=%s" % (_path, _mode))
+chk("索引中所有 .sh 均为 100755", not _mode_bad,
+    ("权限不对: " + ", ".join(_mode_bad)) if _mode_bad
+    else "全部 100755（修法：git update-index --chmod=+x <file>）")
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:
