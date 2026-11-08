@@ -9,7 +9,7 @@ on:
       - release
 
 env:
-  VERSION: 2.1-7
+  VERSION: 2.1-8
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
@@ -31,14 +31,25 @@ jobs:
           echo "--- 关键改动是否在源码里 ---"
           grep -q 'SVPN_DISABLE_ENTRY_MERGE 1' SingleVPN.x \
             || { echo "✗ 回填未关闭"; exit 1; }
-          grep -q 'SingleVPN-svpn.log' SingleVPN.x \
-            || { echo "✗ 日志文件名缺失"; exit 1; }
+          # 2.1-8：交付版必须关诊断（热路径同步写文件会干扰状态栏首帧）
+          grep -q '^#define SVPN_DIAG 0' SingleVPN.x \
+            || { echo "✗ 诊断未关闭"; exit 1; }
+          # 2.1-8：启动窗口透传闸门必须在（respring 首帧插件完全不介入）
+          grep -q 'static volatile int gSVPNReady = 0;' SingleVPN.x \
+            || { echo "✗ 启动闸门缺失"; exit 1; }
+          grep -q 'SVPN_READY_DELAY_SEC' SingleVPN.x \
+            || { echo "✗ 启动窗口时长缺失"; exit 1; }
           echo "✓ 补丁在位"
 
       - name: Source self-check (single source of truth)
         run: |
           set -e
           python3 tools/check_source.py
+
+      - name: Gate self-check (negative injection, zero SKIP)
+        run: |
+          set -e
+          python3 tools/verify_gate218.py
 
   # ------------------------------------------------------------------
   # 构建：**不安装 Theos**。

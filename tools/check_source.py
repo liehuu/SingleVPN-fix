@@ -253,8 +253,12 @@ chk("回填三处均加 enabled 守卫", n_cur == 3, "找到 %d 处" % n_cur)
 chk("A/B 宏 SVPN_DISABLE_ENTRY_MERGE 存在", "SVPN_DISABLE_ENTRY_MERGE" in src)
 
 print("\n[A8] 诊断开关")
-chk("SVPN_DIAG 为 1（本版为诊断版）",
-    re.search(r"^#define\s+SVPN_DIAG\s+1\b", src, re.M) is not None)
+# ★ 2.1-8 方向反转：交付版必须关诊断。
+#   SVPNLog = NSLog + 主线程同步写文件双写；respring 首帧数据必然残缺，
+#   会当场命中 SUSPECT 分支写文件，正好卡在状态栏建实例的时刻。
+#   诊断代码留在源码里备用，但不参与编译。
+chk("SVPN_DIAG 为 0（交付版不编译诊断，热路径无同步 I/O）",
+    re.search(r"^#define\s+SVPN_DIAG\s+0\b", src, re.M) is not None)
 
 print("\n[A9] 多变量声明漏指针星号")
 # 真实踩过：NSString *str = nil, cross = nil;
@@ -637,6 +641,91 @@ if os.path.isfile(_mk):
         "" if not _pax_hits else "显式用了 PAX，dpkg 会拒绝: %s" % _pax_hits[0][1])
     chk("mkdeb.sh 里有 PAX 扩展头自检闸门",
         '_check_no_pax_headers' in _mk_txt)
+
+print("\n[A18] 启动窗口透传闸门（2.1-8 核心修复）")
+# 判据全部锚到「被检查的那一段」，不做全文件泛扫：
+#   _bar / _view / _g16 分别限定数据层 hook 块、iOS17 视图层、iOS16 分支。
+# ★ 每条都必须能失败。写完逐条做反向注入验证（见 tools/verify_gate218.py）。
+_bar_start = src.index("%hook STUIStatusBar")
+_bar_end = src.index("%hook STUIStatusBarCellularNetworkTypeView")
+_bar = src[_bar_start:_bar_end]
+_g17_start = src.index("%group SingleVPN_17")
+_g16_start = src.index("%group SingleVPN_16")
+_g16 = src[_g16_start:_g17_start]
+_g17 = src[_g17_start:]
+
+_delay = re.search(r"^#define\s+SVPN_READY_DELAY_SEC\s+(\d+)\b", src, re.M)
+chk("A18a 启动窗口 >= 3 秒（首帧与数据上报都要在这段时间内完成）",
+    _delay is not None and int(_delay.group(1)) >= 3,
+    "" if _delay else "缺 SVPN_READY_DELAY_SEC 定义")
+chk("A18b 闸门变量是 static volatile int",
+    re.search(r"^static\s+volatile\s+int\s+gSVPNReady\s*=\s*0\s*;", src, re.M) is not None)
+chk("A18c ctor 里用 dispatch_after + 主队列把闸门打开",
+    "dispatch_after(" in _g17
+    and "dispatch_get_main_queue()" in _g17
+    and re.search(r"gSVPNReady\s*=\s*1\s*;", _g17) is not None)
+_bl = _bar.split("\n")
+_gate_open = [i for i, l in enumerate(_bl) if l.strip() == "if (gSVPNReady) {"]
+_gate_close = [i for i, l in enumerate(_bl) if l == "    }"]   # 精确 4 空格，不误吃 8 空格的嵌套 }
+_orig_lines = [i for i, l in enumerate(_bl) if l.strip() == "%orig;"]
+chk("A18d 两个数据层 hook 都包在闸门内，且 %orig 在闸门之外（单一调用点）",
+    len(_gate_open) == 2 and len(_orig_lines) == 2 and len(_gate_close) >= 2
+    # 开启 < 闭合 < %orig：顺序错了就等于窗口内连系统更新都被跳过
+    and all(o < c < x for o, c, x in
+            zip(_gate_open, _gate_close[:2], _orig_lines)),
+    "open=%s close=%s orig=%s" % (_gate_open, _gate_close[:2], _orig_lines))
+chk("A18e iOS17 视图层 5 处染色分支全部受闸门控制",
+    _g17.count("BOOL decision = gSVPNReady && (") == 5
+    and _g17.count("BOOL decision = _isEnabledReversed") == 0,
+    "命中 %d / 漏 %d" % (_g17.count("BOOL decision = gSVPNReady && ("),
+                        _g17.count("BOOL decision = _isEnabledReversed")))
+chk("A18f 5GA 路径三处开关也都受闸门控制",
+    "if (!gSVPNReady || ![text hasPrefix:@\"5G\"]" in _g17
+    and "if (gSVPNReady && _isForce5GAEnabled &&" in _g17
+    and "if (!gSVPNReady || !_isForce5GAEnabled)" in _g17)
+chk("A18g iOS16 分支不受影响（上游基线，用户设备是 iOS 17）",
+    "gSVPNReady" not in _g16)
+
+print("\n[A19] 关诊断后仍可编译（模拟 SVPN_DIAG=0 预处理）")
+# 10-21 真实踩过：#endif 边界错位 → 诊断辅助函数落在 #if 块外，
+# 一关 SVPN_DIAG 就变成「未定义标识符」直接编不过。
+# A2 只数 #if/#endif 配对，配对正确也可能把函数切在块外 —— 必须单独验。
+_DIAG_FNS = ("SVPNLog(", "SVPNLogData(", "SVPNEntryDesc(", "SVPNColorDesc(",
+             "SVPNDataLooksSuspicious(", "SVPNHeartbeatDue(",
+             "SVPNLogFilePath(", "SVPNAppendToFile(", "gDiagCount")
+_kept_lines = []
+_dep = 0
+for _l in src.split("\n"):
+    _t = _l.strip()
+    if re.match(r"^#if\s+SVPN_DIAG\b", _t):
+        _dep += 1
+        _kept_lines.append("")
+        continue
+    if _dep:
+        if re.match(r"^#if", _t):
+            _dep += 1
+        elif re.match(r"^#endif", _t):
+            _dep -= 1
+        _kept_lines.append("")
+        continue
+    _kept_lines.append(_l)
+_kept = "\n".join(_kept_lines)
+# ★ 数 %orig 前必须剥注释：头注释里写了「15 处 %orig」、闸门注释里也提到
+#   「只做 %orig 透传」，不剥会把 15 数成 17，判据变成永真/永假的装饰。
+_kept_nc = "\n".join("" if l.lstrip().startswith("//") else l
+                     for l in _kept_lines)
+chk("A19a 条件块配平", _dep == 0, "剩余嵌套 %d" % _dep)
+_leftover = [f for f in _DIAG_FNS if f in _kept]
+chk("A19b 块外无残留诊断调用（关掉后不会 unrecognized / 未声明）",
+    not _leftover, "残留: %s" % ",".join(_leftover))
+chk("A19c 关掉诊断后功能骨架完整（7 hook / 15 orig / 染色 / 闸门）",
+    len(re.findall(r"^%hook\s", _kept_nc, re.M)) == 7
+    and len(re.findall(r"%orig\b", _kept_nc)) == 15
+    and "svpnColorWithTextColor" in _kept_nc
+    and "gSVPNReady" in _kept_nc
+    and "dispatch_after(" in _kept_nc,
+    "hook=%d orig=%d" % (len(re.findall(r"^%hook\s", _kept_nc, re.M)),
+                         len(re.findall(r"%orig\b", _kept_nc))))
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

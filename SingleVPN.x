@@ -73,6 +73,26 @@
 @property (nonatomic, strong) UIColor *activeColor;
 @end
 
+// ===== 2.1-8：启动窗口透传闸门 ==========================================
+// 症状：respring 后主屏状态栏的信号/WiFi/蜂窝图标整块空白，进 App 正常，
+//       且空白会一直持续到下一次 respring；不装本插件则不出现。
+//
+// 结论：主屏状态栏实例是在 respring 那一刻一次性创建的。只要那一刻
+//       插件介入了数据或样式（回填旧 entry / 改 styleAttrs / 诊断同步写文件），
+//       这个实例就可能建成「无网络 item」的残缺状态；iOS 17 之后不会主动
+//       重建该实例，空白就一直留着。App 内状态栏是另一套实例、走完整创建
+//       流程，所以正常。这也解释了「有时」——取决于首帧数据是否就绪。
+//
+// 做法：不逐个猜是哪个动作惹的祸，而是把插件**整体**挪出启动窗口。
+//       gSVPNReady 为 0 时，所有 hook 只做 %orig 透传，等价于插件不存在；
+//       5 秒后（首帧早已完成、聚合器数据已上报）才允许染色逻辑介入。
+//       - 不改系统数据、不复制私有对象、不新增私有 API 调用 → 不会崩宿主
+//       - 功能零回退：只是 respring 后晚 5 秒开始染色，用户实际无感
+//       - 可证伪：装后仍复现 ⇒ 根因不在启动窗口，下一步只查运行时样式路径
+#define SVPN_READY_DELAY_SEC 5
+static volatile int gSVPNReady = 0;
+// ============================================================================
+
 static BOOL _isEnabled = NO;
 static BOOL _isVPNEnabled = NO;
 static BOOL _isEnabledReversed = NO;
@@ -276,7 +296,12 @@ static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarD
 //
 // 用法：安装后 respring 几次，复现后把日志导出来看。
 // 判定要点见每条记录里的 isNil / isEn 字段。
-#define SVPN_DIAG 1
+//
+// ★ 2.1-8 起关闭。诊断代码留在源码里（便于日后取证），但不参与编译：
+//   SVPNLog 是 NSLog + 主线程同步写文件双写，而 respring 首帧的数据
+//   必然残缺 → 会当场触发 SUSPECT 分支写文件，正好卡在状态栏建实例的
+//   关键时刻。这本身就是新的干扰源，不能带进交付版。
+#define SVPN_DIAG 0
 
 #if SVPN_DIAG
 static NSUInteger gDiagCount = 0;
@@ -627,103 +652,107 @@ static void SVPNLogData(NSString *tag, id data) {
 %hook STUIStatusBar
 
 - (void)_updateWithAggregatedData:(STStatusBarData *)data {
-    STStatusBarData *currentData = [self currentData];
-    _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+    if (gSVPNReady) {
 
-#if SVPN_DIAG
-    // ★ 只在数据可疑时记录：这个方法是每帧走的，绝不能无条件拼字符串。
-    //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
-    //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
-    gDiagSeq = 0;
-    // 心跳：独立于 gDiagCount 上限，保证「数据一直正常」时也能证明 hook 在跑
-    gAggCallCount++;
-    if (SVPNHeartbeatDue(gAggCallCount)) {
-        BOOL hn = NO, hd = NO;
-        SVPNDataLooksSuspicious(data, &hn, &hd);
-        SVPNLog(@"[SVPN] HB agg n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
-              (unsigned long)gAggCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
-              SVPNEntryDesc(@"cell", currentData.cellularEntry),
-              SVPNEntryDesc(@"wifi", currentData.wifiEntry));
-    }
-    if (gDiagCount < gDiagMax) {
-        const void *addr = (__bridge const void *)data;
-        // 只有「和上一条完全同一份对象」才跳过，避免每帧重复拼串。
-        // 注意不能只在可疑时才更新 gLastLoggedData —— 那样同一地址
-        // 在「先正常、后可疑」两次回调里会被判成新数据而重复记录，
-        // 且在地址被复用时可能漏记。这里无条件记账，只做相邻去重。
-        if (addr != gLastLoggedData) {
-            gLastLoggedData = addr;
-            BOOL anyNil = NO, anyDis = NO;
-            BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-            if (bad) {
-                gDiagCount++;
-                gDiagSeq = gDiagCount;
-                SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
-                      (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-                SVPNLogData(@"AGG  in ", data);
-                SVPNLogData(@"AGG  cur", currentData);
+        STStatusBarData *currentData = [self currentData];
+        _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+
+    #if SVPN_DIAG
+        // ★ 只在数据可疑时记录：这个方法是每帧走的，绝不能无条件拼字符串。
+        //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
+        //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
+        gDiagSeq = 0;
+        // 心跳：独立于 gDiagCount 上限，保证「数据一直正常」时也能证明 hook 在跑
+        gAggCallCount++;
+        if (SVPNHeartbeatDue(gAggCallCount)) {
+            BOOL hn = NO, hd = NO;
+            SVPNDataLooksSuspicious(data, &hn, &hd);
+            SVPNLog(@"[SVPN] HB agg n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
+                  (unsigned long)gAggCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
+                  SVPNEntryDesc(@"cell", currentData.cellularEntry),
+                  SVPNEntryDesc(@"wifi", currentData.wifiEntry));
+        }
+        if (gDiagCount < gDiagMax) {
+            const void *addr = (__bridge const void *)data;
+            // 只有「和上一条完全同一份对象」才跳过，避免每帧重复拼串。
+            // 注意不能只在可疑时才更新 gLastLoggedData —— 那样同一地址
+            // 在「先正常、后可疑」两次回调里会被判成新数据而重复记录，
+            // 且在地址被复用时可能漏记。这里无条件记账，只做相邻去重。
+            if (addr != gLastLoggedData) {
+                gLastLoggedData = addr;
+                BOOL anyNil = NO, anyDis = NO;
+                BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+                if (bad) {
+                    gDiagCount++;
+                    gDiagSeq = gDiagCount;
+                    SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
+                          (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+                    SVPNLogData(@"AGG  in ", data);
+                    SVPNLogData(@"AGG  cur", currentData);
+                }
             }
         }
-    }
-#endif
+    #endif
 
-    if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
-        data = svpnMergeMissingEntries(self, data);
-    }
+        if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
+            data = svpnMergeMissingEntries(self, data);
+        }
 
-#if SVPN_DIAG
-    if (gDiagSeq) {
-        SVPNLogData(@"AGG  out", data);
+    #if SVPN_DIAG
+        if (gDiagSeq) {
+            SVPNLogData(@"AGG  out", data);
+        }
+    #endif
     }
-#endif
-
     %orig;
 }
 
 - (void)_updateWithData:(STStatusBarData *)data completionHandler:(id)a4 {
-    STStatusBarData *currentData = [self currentData];
-    _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+    if (gSVPNReady) {
 
-#if SVPN_DIAG
-    gDiagSeq = 0;
-    gUpdCallCount++;
-    if (SVPNHeartbeatDue(gUpdCallCount)) {
-        BOOL hn = NO, hd = NO;
-        SVPNDataLooksSuspicious(data, &hn, &hd);
-        SVPNLog(@"[SVPN] HB upd n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
-              (unsigned long)gUpdCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
-              SVPNEntryDesc(@"cell", currentData.cellularEntry),
-              SVPNEntryDesc(@"wifi", currentData.wifiEntry));
-    }
-    if (gDiagCount < gDiagMax) {
-        const void *addr = (__bridge const void *)data;
-        // 用独立变量做去重：两个 hook 共用一份会互相覆盖，导致该记的被跳过
-        if (addr != gLastLoggedData2) {
-            gLastLoggedData2 = addr;
-            BOOL anyNil = NO, anyDis = NO;
-            BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-            if (bad) {
-                gDiagCount++;
-                gDiagSeq = gDiagCount;
-                SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
-                      (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-                SVPNLogData(@"UPD  in ", data);
-                SVPNLogData(@"UPD  cur", currentData);
+        STStatusBarData *currentData = [self currentData];
+        _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+
+    #if SVPN_DIAG
+        gDiagSeq = 0;
+        gUpdCallCount++;
+        if (SVPNHeartbeatDue(gUpdCallCount)) {
+            BOOL hn = NO, hd = NO;
+            SVPNDataLooksSuspicious(data, &hn, &hd);
+            SVPNLog(@"[SVPN] HB upd n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
+                  (unsigned long)gUpdCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
+                  SVPNEntryDesc(@"cell", currentData.cellularEntry),
+                  SVPNEntryDesc(@"wifi", currentData.wifiEntry));
+        }
+        if (gDiagCount < gDiagMax) {
+            const void *addr = (__bridge const void *)data;
+            // 用独立变量做去重：两个 hook 共用一份会互相覆盖，导致该记的被跳过
+            if (addr != gLastLoggedData2) {
+                gLastLoggedData2 = addr;
+                BOOL anyNil = NO, anyDis = NO;
+                BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
+                if (bad) {
+                    gDiagCount++;
+                    gDiagSeq = gDiagCount;
+                    SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
+                          (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
+                    SVPNLogData(@"UPD  in ", data);
+                    SVPNLogData(@"UPD  cur", currentData);
+                }
             }
         }
-    }
-#endif
+    #endif
 
-    if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
-        data = svpnMergeMissingEntries(self, data);
-    }
+        if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
+            data = svpnMergeMissingEntries(self, data);
+        }
 
-#if SVPN_DIAG
-    if (gDiagSeq) {
-        SVPNLogData(@"UPD  out", data);
+    #if SVPN_DIAG
+        if (gDiagSeq) {
+            SVPNLogData(@"UPD  out", data);
+        }
+    #endif
     }
-#endif
-
     %orig;
 }
 
@@ -732,10 +761,10 @@ static void SVPNLogData(NSString *tag, id data) {
 %hook STUIStatusBarCellularNetworkTypeView
 
 - (void)setText:(NSString *)text prefixLength:(NSInteger)prefixLength withStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs forType:(NSInteger)type animated:(BOOL)animated {
-    if (![text hasPrefix:@"5G"] || !_isForce5GAEnabled) {
+    if (!gSVPNReady || ![text hasPrefix:@"5G"] || !_isForce5GAEnabled) {
         %orig;
         if (@available(iOS 16, *)) {
-            if (_isForce5GAEnabled && !self.widthConstraint.active) {
+            if (gSVPNReady && _isForce5GAEnabled && !self.widthConstraint.active) {
                 objc_setAssociatedObject(self, @selector(widthConstraint), nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 self.widthConstraint.active = YES;
             }
@@ -767,7 +796,7 @@ static void SVPNLogData(NSString *tag, id data) {
 %new
 - (void)svpnApply5GAdvancedAttributesIfNeeded {
     if (@available(iOS 16, *)) {
-        if (!_isForce5GAEnabled) {
+        if (!gSVPNReady || !_isForce5GAEnabled) {
             return;
         }
 
@@ -809,7 +838,7 @@ static void SVPNLogData(NSString *tag, id data) {
 }
 
 - (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
     if (decision && IsNetworkTypeText(self.text)) {
         styleAttrs = [styleAttrs copy];
         [styleAttrs setTextColor:svpnColorWithTextColor(styleAttrs.textColor)];
@@ -822,7 +851,7 @@ static void SVPNLogData(NSString *tag, id data) {
 - (void)setText:(NSString *)text {
     %orig;
 
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
     if (decision && IsNetworkTypeText(text)) {
         [self setTextColor:svpnColorWithTextColor(self.textColor)];
     }
@@ -835,7 +864,7 @@ static void SVPNLogData(NSString *tag, id data) {
 %hook STUIStatusBarWifiSignalView
 
 - (void)setActiveColor:(UIColor *)activeColor {
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
 
 #if SVPN_DIAG
     // 只在「颜色为空」或「前 40 次染色」时记录 —— 后者用来抓
@@ -859,7 +888,7 @@ static void SVPNLogData(NSString *tag, id data) {
 }
 
 - (void)setInactiveColor:(UIColor *)inactiveColor {
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
     if (decision) {
         inactiveColor = [svpnColorWithTextColor(inactiveColor) colorWithAlphaComponent:0.2];
     }
@@ -868,7 +897,7 @@ static void SVPNLogData(NSString *tag, id data) {
 }
 
 - (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
 
 #if SVPN_DIAG
     // 这是蜂窝图标真正吃染色的入口（改的是 styleAttrs 的 imageTintColor，
@@ -905,7 +934,7 @@ static void SVPNLogData(NSString *tag, id data) {
 #if SVPN_DIAG
     // ★ 必须在 IsEnabled 判断之前打：否则「插件被关掉」时一条日志都没有，
     //   会被误判成「诊断版没装上」，白跑一轮。
-    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-7)");
+    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-8)");
     SVPNLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
     // 告诉用户日志落在哪：抓不到系统日志时可直接用 Filza 打开这个文件
     NSString *svpn_lp = SVPNLogFilePath();
@@ -1005,4 +1034,14 @@ static void SVPNLogData(NSString *tag, id data) {
     } else {
         %init(SingleVPN_16);
     }
+
+    // 2.1-8：启动窗口结束后才允许插件介入状态栏。
+    // 放在 %init 之后：hook 先装好，窗口内走纯透传分支；
+    // 窗口一过，下一次状态栏更新自然带上染色，无需主动触发重绘（不碰私有刷新 API）。
+    // gSVPNReady 只是个 int，读写都在主线程（状态栏更新与 hook 同线程），无需加锁。
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SVPN_READY_DELAY_SEC * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            gSVPNReady = 1;
+        });
 }
