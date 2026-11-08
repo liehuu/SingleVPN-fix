@@ -1,4 +1,4 @@
-"""2.1-8 新增判据的反向验证（零 SKIP）。
+"""2.1-8 / 2.1-9 新增判据的反向验证（零 SKIP）。
 
 三段式：① 断言注入真的发生了（文件字节变了）
         ② 断言「是哪条判据拦下的」（不能只看退出码非 0）
@@ -33,6 +33,18 @@ def one_replace(name, old, new, expect_gate, count=1, file="x"):
     def fn(s):
         assert s.count(old) == count, "%s 锚点命中 %d 次（期望 %d）" % (name, s.count(old), count)
         return s.replace(old, new, count)
+    return (name, file, fn, expect_gate)
+
+
+def replace_first(name, old, new, expect_gate, file="x"):
+    """锚点在文件里出现多次时，只注入第一处。
+
+    one_replace 的 count 同时约束「锚点出现次数」和「替换次数」，
+    两个数据层 hook 写法完全相同时没法只改一处 → 用它。
+    """
+    def fn(s):
+        assert old in s, "%s 锚点未命中" % name
+        return s.replace(old, new, 1)
     return (name, file, fn, expect_gate)
 
 
@@ -79,6 +91,22 @@ CASES = [
                 "    }\n    %orig;\n}\n\n- (void)_updateWithData:",
                 "    }\n    // orig removed\n}\n\n- (void)_updateWithData:",
                 "A19c 关掉诊断后功能骨架完整"),
+
+    # ---- SingleVPN.x：VPN 状态判定（2.1-9 修复断开不恢复）----
+    replace_first("A22a 状态又退回上一轮 OR（断开 VPN 不恢复）",
+                  "        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }",
+                  "        _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;",
+                  "A22a 两个数据层 hook"),
+    replace_first("A22b 数据层多出一处状态写入",
+                  "        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }",
+                  "        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }\n"
+                  "        _isVPNEnabled = YES;",
+                  "A22b 数据层没有第三处状态写入"),
+    replace_first("A22c 上一轮快照声明漏回诊断块",
+                  "        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }",
+                  "        STStatusBarData *currentData = [self currentData];\n"
+                  "        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }",
+                  "A22c 关诊断后数据层实代码里不含上一轮快照"),
 
     # ---- devkit/mkdeb.sh：装包红线 ----
     one_replace("A20 postinst 混入 sbreload（会杀前台 Sileo → 半装）",

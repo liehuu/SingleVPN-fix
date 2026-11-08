@@ -654,10 +654,15 @@ static void SVPNLogData(NSString *tag, id data) {
 - (void)_updateWithAggregatedData:(STStatusBarData *)data {
     if (gSVPNReady) {
 
-        STStatusBarData *currentData = [self currentData];
-        _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+        // 2.1-9：VPN 状态只认本轮 data 携带的条目，本轮没带就保持上一轮值。
+        // 上游 6e068f7 当初为配合「回填旧 entry」，把上一轮快照与 data 做或运算；
+        // 2.1-8 已关掉回填，这个 OR 失去前提，却把断开时的旧 YES 永久锁存
+        // → 连上能染色、断开不恢复。
+        STStatusBarDataEntry *vpnNow = data.vpnEntry;
+        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }
 
     #if SVPN_DIAG
+        STStatusBarData *currentData = [self currentData];
         // ★ 只在数据可疑时记录：这个方法是每帧走的，绝不能无条件拼字符串。
         //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
         //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
@@ -710,10 +715,15 @@ static void SVPNLogData(NSString *tag, id data) {
 - (void)_updateWithData:(STStatusBarData *)data completionHandler:(id)a4 {
     if (gSVPNReady) {
 
-        STStatusBarData *currentData = [self currentData];
-        _isVPNEnabled = currentData.vpnEntry.enabled || data.vpnEntry.enabled;
+        // 2.1-9：VPN 状态只认本轮 data 携带的条目，本轮没带就保持上一轮值。
+        // 上游 6e068f7 当初为配合「回填旧 entry」，把上一轮快照与 data 做或运算；
+        // 2.1-8 已关掉回填，这个 OR 失去前提，却把断开时的旧 YES 永久锁存
+        // → 连上能染色、断开不恢复。
+        STStatusBarDataEntry *vpnNow = data.vpnEntry;
+        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }
 
     #if SVPN_DIAG
+        STStatusBarData *currentData = [self currentData];
         gDiagSeq = 0;
         gUpdCallCount++;
         if (SVPNHeartbeatDue(gUpdCallCount)) {
@@ -934,7 +944,7 @@ static void SVPNLogData(NSString *tag, id data) {
 #if SVPN_DIAG
     // ★ 必须在 IsEnabled 判断之前打：否则「插件被关掉」时一条日志都没有，
     //   会被误判成「诊断版没装上」，白跑一轮。
-    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-8)");
+    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-9)");
     SVPNLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
     // 告诉用户日志落在哪：抓不到系统日志时可直接用 Filza 打开这个文件
     NSString *svpn_lp = SVPNLogFilePath();

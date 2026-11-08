@@ -9,7 +9,7 @@ on:
       - release
 
 env:
-  VERSION: 2.1-8
+  VERSION: 2.1-9
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
@@ -39,6 +39,10 @@ jobs:
             || { echo "✗ 启动闸门缺失"; exit 1; }
           grep -q 'SVPN_READY_DELAY_SEC' SingleVPN.x \
             || { echo "✗ 启动窗口时长缺失"; exit 1; }
+          # 2.1-9：VPN 状态只认本轮 data，禁止与上一轮快照做或运算
+          # （OR 会把断开时的旧 YES 永久锁存 → 连上染色、断开不恢复）
+          test "$(grep -Fc '        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }' SingleVPN.x)" -eq 2 \
+            || { echo "✗ VPN 状态判定未修（应恰好两处）"; exit 1; }
           echo "✓ 补丁在位"
 
       - name: Source self-check (single source of truth)

@@ -762,6 +762,27 @@ chk("A21b 有构建期闸门解包回验（不只靠源码里写了 skip）",
     and "data.tar 含 DEBIAN 条目" in _raw20
     and "_bad" in _raw20)
 
+print("\n[A22] VPN 状态只认本轮数据（2.1-9 修复「断开不恢复」）")
+# 上游 6e068f7 为配合「回填旧 entry」，把上一轮快照与 data 做或运算；
+# 2.1-8 关掉回填后这个 OR 失去前提，却把断开时的旧 YES 永久锁存。
+# ★ 判据锚「数据层 hook 段」并剥注释，防止被头注释里的说明文字代答。
+# ★ 三条必须各自能独立失败，见 tools/verify_gate218.py 的 A22 反向用例。
+_bar_nc = strip_code(_bar)
+_vpn_upd = [l.strip() for l in _bar_nc.split("\n")
+            if re.fullmatch(r"if\s*\(\s*vpnNow\s*\)\s*\{\s*_isVPNEnabled\s*=\s*vpnNow\.enabled\s*;\s*\}",
+                            l.strip())]
+chk("A22a 两个数据层 hook 都是「本轮有条目才更新」",
+    len(_vpn_upd) == 2, "命中 %d 处（期望 2）" % len(_vpn_upd))
+_all_writes = re.findall(r"_isVPNEnabled\s*=", _bar_nc)
+chk("A22b 数据层没有第三处状态写入（防止别处把状态改回去）",
+    len(_all_writes) == 2, "共 %d 处" % len(_all_writes))
+_ks = _kept_nc.find("%hook STUIStatusBar")
+_ke = _kept_nc.find("%hook STUIStatusBarCellularNetworkTypeView", _ks)
+_bar_kept = _kept_nc[_ks:_ke] if _ks >= 0 and _ke > _ks else ""
+chk("A22c 关诊断后数据层实代码里不含上一轮快照 currentData",
+    bool(_bar_kept) and "currentData" not in _bar_kept,
+    "" if "currentData" not in _bar_kept else "残留 currentData")
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:
