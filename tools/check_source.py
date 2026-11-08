@@ -654,8 +654,12 @@ _bar_start = src.index("%hook STUIStatusBar")
 _bar_end = src.index("%hook STUIStatusBarCellularNetworkTypeView")
 _bar = src[_bar_start:_bar_end]
 _g17_start = src.index("%group SingleVPN_17")
+# ★ iOS16 分支的范围必须收在它自己的 %end 上，不能用「到 %group SingleVPN_17
+#   为止」—— 这两者之间还夹着诊断块和 2.1-10 的还原模块，把整段当成 iOS16
+#   分支会让 A18g 假红（2.1-10 插入还原模块时真实踩到）。
 _g16_start = src.index("%group SingleVPN_16")
-_g16 = src[_g16_start:_g17_start]
+_g16_end = src.index("%end // SingleVPN_16")
+_g16 = src[_g16_start:_g16_end]
 _g17 = src[_g17_start:]
 
 _delay = re.search(r"^#define\s+SVPN_READY_DELAY_SEC\s+(\d+)\b", src, re.M)
@@ -782,6 +786,128 @@ _bar_kept = _kept_nc[_ks:_ke] if _ks >= 0 and _ke > _ks else ""
 chk("A22c 关诊断后数据层实代码里不含上一轮快照 currentData",
     bool(_bar_kept) and "currentData" not in _bar_kept,
     "" if "currentData" not in _bar_kept else "残留 currentData")
+
+print("\n[A23] 断开 VPN 后视图层还原（2.1-10 修复桌面染色残留）")
+# 用户的实测把范围钉死了：App 内颜色已正常退回（数据层 2.1-9 成立），
+# 只有桌面残留 → 桌面那套常驻状态栏视图实例不会被系统重新下发样式，
+# 上一次染上去的颜色就留在视图上。修法是「染色时记下系统原色，断开时回写」。
+# ★ 三条最容易写错、且错了会静默失效的点各一条判据：
+#   a 记的是系统原色而不是自己染的色（把绿色当系统色存 = 还原成绿色 = 没修）
+#   b 过渡触发挂在两个数据层 hook 上（漏一个就有一半断开场景不还原）
+#   c 还原前必须重新确认「现在确实不该染」（断开又秒连时擦色 = 制造新 bug）
+#
+# ★ 区间必须精确，两种错法都会让判据变成摆设：
+#   ① 用「%end // SingleVPN_16 到 %group SingleVPN_17」= 把诊断块、回填函数
+#      一起算进来（2.1-10 首次加判据时真实踩到：诊断块里的 @try/@finally
+#      让 A23e 假红，注释里的方法名让 A23d 假红）
+#   ② 染色点在 %hook 内部，属于 _g17，不在还原模块里 —— 用还原模块数它们
+#      永远是 0 处
+_MOD10 = "// ===== 2.1-10：断开 VPN 后把染色还原"
+_r_mod = src[src.index(_MOD10):_g17_start]     # 还原模块（函数 + 注释）
+_r_nc = strip_code(_r_mod)
+_g17_nc = strip_code(_g17)                     # iOS17 分组（含五个染色点）
+
+
+def body_of(name, txt):
+    """按花括号配平取出某个函数的函数体（含外层 {}）。
+
+    ★ 判据必须锚「被检查的那一段」：`if (!gSVPNReady)` 这种闸门出现在本模块
+      两个函数里，用整个模块去找会被另一个函数代答（A23b5 注入时真实踩到）。
+    """
+    i = txt.find(name)
+    if i < 0:
+        return ""
+    b = txt.find("{", i)
+    if b < 0:
+        return ""
+    depth = 0
+    for j in range(b, len(txt)):
+        if txt[j] == "{":
+            depth += 1
+        elif txt[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return txt[b:j + 1]
+    return ""
+
+
+_restore_body = body_of("static void SVPNRestorePaintedViewsNow(void)", _r_nc)
+
+chk("A23a1 还原模块在 iOS17 分组之外（iOS16 分支保持上游基线）",
+    "SVPNRestorePaintedViewsNow" in _r_mod and "SVPNRestorePaintedViewsNow" not in _g16)
+chk("A23a2 还原表 key 用 weak + 指针同一性（视图销毁自动出表，且不按 isEqual 合并）",
+    "NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality" in _r_mod
+    and "mapTableWithKeyOptions:kOpt" in _r_mod)
+# ★ 真正的危险是「遍历集合的同时改它」，不是两段循环的先后 —— 首版判据
+#   写成「收集循环在还原循环之前」，注入 removeObjectForKey 后顺序没变 → 拦不住。
+#   改成直接把收集循环的循环体抓出来，断言里面没有对登记表的写操作。
+_c_for = _r_nc.find("for (id v in gSVPNOriginals) {")
+_c_body = ""
+if _c_for >= 0:
+    _c_end = _r_nc.find("\n        }", _c_for)
+    _c_body = _r_nc[_c_for:_c_end if _c_end > 0 else _c_for + 400]
+chk("A23a3 收集循环体内不修改登记表（边遍历边改 NSMapTable 是未定义行为）",
+    bool(_c_body) and "removeObjectForKey" not in _c_body and "setObject:" not in _c_body,
+    "循环体 %d 字节" % len(_c_body) if _c_body else "循环体没抓到")
+chk("A23a3b 收集完成后才逐个还原（不边遍历边改）",
+    0 <= _c_for < _r_nc.find("for (id view in views)"),
+    "collect=%d restore=%d" % (_c_for, _r_nc.find("for (id view in views)")))
+chk("A23a4 每条 slot 还原前先 respondsToSelector（不存在的选择子直接跳过）",
+    "respondsToSelector:sel" in _r_mod and "methodForSelector:sel" in _r_mod)
+# ★ 必须锚行首（re.M + ^）：否则 `// #define SVPN_RESTORE_MAX_VIEWS 32`
+#   这种「被注释掉的宏」照样能匹配到，判据变成永真（反向注入 A23a5 时真实踩到）。
+chk("A23a5 寄存器表上限有界（宏未被注释/删除）",
+    re.search(r"^#define\s+SVPN_RESTORE_MAX_VIEWS\s+\d+\s*$", _r_mod, re.M) is not None)
+# 表里只放四个真正能回写的槽位；dim 没有对应视图 setter，放进来就是死条目
+chk("A23a6 还原计划只含可回写的槽位（tc/ac/ic/tint，不含 dim）",
+    '@[@"tc", @"setTextColor:"]' in _r_mod
+    and '@[@"ac", @"setActiveColor:"]' in _r_mod
+    and '@[@"ic", @"setInactiveColor:"]' in _r_mod
+    and '@[@"tint", @"setTintColor:"]' in _r_mod
+    and '@[@"dim"' not in _r_mod)
+# ★ a：残留识别。setText: 路径读的是 self.textColor，可能是上一轮染的绿，
+#   必须有「等于上次染的色就拒绝记账」这道判断，否则还原会还原成绿色。
+chk("A23b1 识别残留：等于上次染的色就不当系统色记账",
+    "if (last && [last isEqual:color])" in _r_mod)
+# ★ b：过渡触发。两个数据层 hook 各一处，少一处就有一半场景不还原。
+chk("A23b2 两个数据层 hook 都触发过渡检测", _bar_nc.count("SVPNNoteDecisionTransition();") == 2,
+    "命中 %d 处（期望 2）" % _bar_nc.count("SVPNNoteDecisionTransition();"))
+chk("A23b3 只在 1→0 时触发（连上不擦色）",
+    "if (prev == 1 && !now)" in _r_mod)
+# ★ c：执行期复核。异步一拍之后状态可能已经变了。
+chk("A23b4 还原前重新确认当前不该染", "if (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled) {" in _restore_body
+    and _restore_body.find("if (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled) {")
+    < _restore_body.find("NSMutableArray *views = [NSMutableArray array];"))
+chk("A23b5 还原有独立闸门，不受启动窗口影响（启动期间不该有染色也就无需还原）",
+    "if (!gSVPNReady) {\n        return;\n    }" in _restore_body,
+    "还原函数体 %d 字节" % len(_restore_body))
+# 染色侧：五个染色点都在 iOS17 分组里，必须同时记原色 + 记染上的色。
+# 与 A18e 的「5 处染色分支」是同一批（tc×2 / ac / ic / tint）。
+_n_orig = _g17_nc.count("SVPNRememberOriginal(self,")
+chk("A23c1 五个染色点都记系统原色", _n_orig == 5, "命中 %d 处（期望 5）" % _n_orig)
+_n_paint = _g17_nc.count("SVPNRememberPainted(self,")
+chk("A23c2 每个染色点同时记染上的色", _n_paint == 5, "命中 %d 处（期望 5）" % _n_paint)
+# ★ 顺序：applyStyleAttributes: 里必须「先读原值再 copy 后改」，反过来读到的是改后的值
+_as = _g17.find("- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {")
+_as_body = _g17[_as:_as + 1400] if _as >= 0 else ""
+_i_sys = _as_body.find("UIColor *sysTextColor = styleAttrs.textColor;")
+chk("A23c3 StringView 侧先取原色再 copy 再染色（顺序反了会记下自己的色）",
+    0 <= _i_sys < _as_body.find("styleAttrs = [styleAttrs copy];")
+    < _as_body.find('SVPNRememberOriginal(self, @"tc", sysTextColor);'),
+    "sys=%d copy=%d rec=%d" % (_i_sys, _as_body.find("styleAttrs = [styleAttrs copy];"),
+                               _as_body.find('SVPNRememberOriginal(self, @"tc", sysTextColor);')))
+# 反向断言：不得去调系统的私有重绘 API（那是「主动刷新宿主」，风险最高的一类）
+# ★ 必须先剥注释：还原模块的注释里就写着「不主动重绘」并提到了这些方法名，
+#   直接数原文会把自己的说明文字当成调用（本项目已犯过五次同类错）。
+for _bad_api in ("_updateWithAggregatedData", "setNeedsStatusBarAppearanceUpdate",
+                 "_updateWithData", "layoutIfNeeded", "layoutSubviews"):
+    chk("A23d 还原路径不主动重绘宿主（不调用 %s）" % _bad_api,
+        _r_nc.count(_bad_api) == 0,
+        "出现 %d 次" % _r_nc.count(_bad_api))
+_t = _r_nc.count("@try")
+_c = _r_nc.count("@catch")
+chk("A23e 还原全程 @try 包裹（异常绝不出宿主进程）",
+    _t >= 6 and _c == _t, "try=%d catch=%d" % (_t, _c))
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

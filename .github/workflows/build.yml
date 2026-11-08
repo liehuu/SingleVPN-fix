@@ -9,7 +9,7 @@ on:
       - release
 
 env:
-  VERSION: 2.1-9
+  VERSION: 2.1-10
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
@@ -43,6 +43,14 @@ jobs:
           # （OR 会把断开时的旧 YES 永久锁存 → 连上染色、断开不恢复）
           test "$(grep -Fc '        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }' SingleVPN.x)" -eq 2 \
             || { echo "✗ VPN 状态判定未修（应恰好两处）"; exit 1; }
+          # 2.1-10：断开 VPN 后必须能自己把染色擦回（桌面那套状态栏视图
+          # 不会因断开而被系统重新下发样式，光靠 decision==NO 透传是不够的）
+          grep -q 'SVPNRestorePaintedViewsNow' SingleVPN.x \
+            || { echo "✗ 断开还原路径缺失"; exit 1; }
+          test "$(grep -Fc '        SVPNNoteDecisionTransition();' SingleVPN.x)" -eq 2 \
+            || { echo "✗ 过渡检测未挂满两个数据层 hook"; exit 1; }
+          test "$(grep -Fc 'SVPNRememberOriginal(self,' SingleVPN.x)" -eq 5 \
+            || { echo "✗ 染色点没记系统原色（应恰好五处）"; exit 1; }
           echo "✓ 补丁在位"
 
       - name: Source self-check (single source of truth)

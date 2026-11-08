@@ -647,6 +647,221 @@ static void SVPNLogData(NSString *tag, id data) {
 #endif
 // ============================================================================
 
+// ===== 2.1-10：断开 VPN 后把染色还原（桌面状态栏专用）=======================
+// 症状（用户实测）：断开 VPN 后桌面状态栏的信号 / WiFi 图标仍是绿色，
+//                   但打开任意 App，App 内状态栏的颜色已正常退回。
+//
+// 这条实测把范围钉死了：
+//   ① App 内正常 ⇒ _isVPNEnabled 已正确回落为 NO（2.1-9 的数据层修复成立）
+//   ② 只有桌面残留 ⇒ 数据对了，是「视图没跟上」
+//
+// 机制：视图层染色是「一次性下发」而不是「持续施加」。decision==NO 时下面四个
+//   hook 只是纯透传系统原值，**前提是这些方法会再被调用一次**。VPN 断开通常
+//   不改变信号格数 / WiFi 强度 / 网络类型文字，系统不会重新下发样式属性 →
+//   它们不再被调用 → 上一轮染上去的颜色就留在视图上。App 内状态栏是另一个
+//   实例、进入时走完整创建流程（必调 applyStyleAttributes:），所以那里正常。
+//
+// 做法：染色时顺手记下「这个视图本来该是什么色」，检测到 decision 由「染」
+//       变成「不染」时把这些色回写回去。四条硬约束：
+//   ① 系统色的来源必须干净。applyStyleAttributes: 里改的是 copy，原始入参
+//      没动 → 直接读它最可信；setActiveColor:/setInactiveColor: 的入参同理。
+//      只有 setText: 读的是 self.textColor，可能已被上一轮染过，所以用
+//      「当前值 == 上次染的色」判出残留并拒绝记账 —— 否则第二次调用会把绿色
+//      当成系统色存下来，还原时还原成绿色，等于没修。
+//   ② 只还原自己改过的那几个槽位，不做全量 tintColor 重置；每个 slot 还原前
+//      先 respondsToSelector: → 不存在就跳过，绝不 unrecognized selector。
+//   ③ 表用 weak key（视图销毁自动出表）+ 指针同一性（绝不按 isEqual 合并两个
+//      不同视图）+ 还原前先收集再改（边遍历边改 NSMapTable 是不安全的）。
+//   ④ 还原推到主队列下一拍，且执行前重新确认「现在确实不该染」——
+//      断开后 0.1 秒又连上的话，擦掉刚染的色就是制造新 bug。
+//
+// 可证伪：装后断开 VPN，桌面颜色立刻退回 ⇒ 修好；
+//         仍残留但点开任意 App 再回桌面就正常 ⇒ 过渡检测没触发，查 A23d；
+//         仍残留且怎么切都不退 ⇒ 记下的系统色不对，查 ①。
+#define SVPN_RESTORE_MAX_VIEWS 32
+
+static NSMapTable *gSVPNOriginals = nil;   // 视图 → 该系统原色（按 slot 存）
+static NSMapTable *gSVPNPainted = nil;     // 视图 → 我们染上去的色（识别残留用）
+static int gSVPNLastDecision = -1;         // -1 未知 / 0 表示不染 / 1 表示染
+
+/// ★ key 必须 WeakMemory + ObjectPointerPersonality。
+///   只写 weakToStrongObjectsMapTable 会退回默认 personality，
+///   一旦某个视图类重写了 isEqual 就可能把两个视图并成一条 → 还原时串味。
+static void SVPNEnsureViewTables(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSPointerFunctionsOptions kOpt =
+            NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality;
+        NSPointerFunctionsOptions vOpt =
+            NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality;
+        gSVPNOriginals = [NSMapTable mapTableWithKeyOptions:kOpt valueOptions:vOpt];
+        gSVPNPainted = [NSMapTable mapTableWithKeyOptions:kOpt valueOptions:vOpt];
+    });
+}
+
+/// 取（必要时创建）某个视图自己的 slot 字典
+static NSMutableDictionary *SVPNViewSlotDict(NSMapTable *tbl, id view) {
+    if (!tbl || !view) {
+        return nil;
+    }
+    NSMutableDictionary *d = nil;
+    @try {
+        d = [tbl objectForKey:view];
+        if (!d) {
+            d = [NSMutableDictionary dictionary];
+            [tbl setObject:d forKey:view];
+        }
+    } @catch (NSException *e) {
+        return nil;
+    }
+    return d;
+}
+
+/// 记下「这个视图本来该是什么色」。
+/// 若 color 正好等于我们上一轮染上去的值，说明这是残留（setText: 路径会遇到），
+/// 拒绝记账 —— 把绿色当系统色存下来是这套机制唯一会把事情办坏的写法。
+static void SVPNRememberOriginal(id view, NSString *slot, UIColor *color) {
+    if (!view || !slot || !color) {
+        return;
+    }
+    @try {
+        SVPNEnsureViewTables();
+        NSDictionary *p = [gSVPNPainted objectForKey:view];
+        UIColor *last = p ? [p objectForKey:slot] : nil;
+        if (last && [last isEqual:color]) {
+            return;
+        }
+        NSMutableDictionary *d = SVPNViewSlotDict(gSVPNOriginals, view);
+        if (d) {
+            [d setObject:color forKey:slot];
+        }
+    } @catch (NSException *e) {
+        // 记账失败最多是这次还原不全，绝不影响宿主
+    }
+}
+
+/// 记下「我们染上去的是什么色」，供下一轮识别残留
+static void SVPNRememberPainted(id view, NSString *slot, UIColor *color) {
+    if (!view || !slot || !color) {
+        return;
+    }
+    @try {
+        SVPNEnsureViewTables();
+        NSMutableDictionary *d = SVPNViewSlotDict(gSVPNPainted, view);
+        if (d) {
+            [d setObject:color forKey:slot];
+        }
+    } @catch (NSException *e) {
+    }
+}
+
+/// 把记下来的系统色回写。slot → setter 一一对应，不存在的选择子直接跳过。
+static void SVPNRestorePaintedViewsNow(void) {
+    if (!gSVPNReady) {
+        return;
+    }
+    // ④ 延后执行期间可能已经重新连上，此时擦色就是新 bug
+    if (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled) {
+        return;
+    }
+    if (!gSVPNOriginals) {
+        return;
+    }
+
+    // ③ 先把视图收集到数组，再按数组还原：
+    //    NSMapTable 在 fast enumeration 过程中被访问/修改属于未定义行为。
+    NSMutableArray *views = [NSMutableArray array];
+    @try {
+        for (id v in gSVPNOriginals) {
+            if (v) {
+                [views addObject:v];
+            }
+            if ([views count] >= SVPN_RESTORE_MAX_VIEWS) {
+                break;
+            }
+        }
+    } @catch (NSException *e) {
+        return;
+    }
+
+    // slot → 还原用的 setter（顺序无关，逐条独立判定）
+    // ★ 只登记真正被染过的三个槽位。dim（imageDimmedTintColor）是 styleAttrs
+    //   上的属性、没有对应的视图 setter，登记了也永远还原不了，故不放进来。
+    NSArray *plan = @[
+        @[@"tc", @"setTextColor:"],
+        @[@"ac", @"setActiveColor:"],
+        @[@"ic", @"setInactiveColor:"],
+        @[@"tint", @"setTintColor:"],
+    ];
+
+    for (id view in views) {
+        NSDictionary *d = nil;
+        @try {
+            d = [gSVPNOriginals objectForKey:view];
+        } @catch (NSException *e) {
+            continue;
+        }
+        if (!d) {
+            continue;
+        }
+        for (NSArray *pair in plan) {
+            UIColor *c = nil;
+            @try {
+                c = [d objectForKey:pair[0]];
+            } @catch (NSException *e) {
+                c = nil;
+            }
+            if (!c) {
+                continue;
+            }
+            SEL sel = NSSelectorFromString(pair[1]);
+            if (!sel || ![view respondsToSelector:sel]) {
+                continue;
+            }
+            // 用 IMP 直调：绕开 performSelector 在 ARC 下的 leak 警告，
+            // 也不引入 objc_msgSend 的裸函数指针转换
+            @try {
+                IMP imp = [view methodForSelector:sel];
+                if (imp) {
+                    ((void (*)(id, SEL, id))imp)(view, sel, c);
+                }
+            } @catch (NSException *e) {
+            }
+        }
+        @try {
+            [view setNeedsDisplay];
+        } @catch (NSException *e) {
+        }
+    }
+}
+
+/// 过渡触发：不在「系统正消化本轮数据」的中途改视图，推到主队列下一拍。
+/// 状态栏所有 hook 都在主线程，登记表因此无需加锁。
+static void SVPNRestorePaintedViewsAsync(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            SVPNRestorePaintedViewsNow();
+        } @catch (NSException *e) {
+            // 绝不外泄：还原失败最多是颜色晚点退，不能因此崩宿主
+        }
+    });
+}
+
+/// 每个数据层 hook 末尾调一次。两个 hook 都会调，第二次进来 prev 已是 0，
+/// 不会重复触发 —— 天然去重，不需要额外的重入标志。
+static void SVPNNoteDecisionTransition(void) {
+    if (!gSVPNReady) {
+        return;
+    }
+    BOOL now = (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
+    int prev = gSVPNLastDecision;
+    gSVPNLastDecision = now ? 1 : 0;
+    if (prev == 1 && !now) {
+        SVPNRestorePaintedViewsAsync();
+    }
+}
+// ============================================================================
+
 %group SingleVPN_17
 
 %hook STUIStatusBar
@@ -660,6 +875,9 @@ static void SVPNLogData(NSString *tag, id data) {
         // → 连上能染色、断开不恢复。
         STStatusBarDataEntry *vpnNow = data.vpnEntry;
         if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }
+        // 2.1-10：状态可能刚从「染」变成「不染」，此时桌面那套常驻视图
+        // 不会被系统重新下发样式，必须自己把颜色擦回去。
+        SVPNNoteDecisionTransition();
 
     #if SVPN_DIAG
         STStatusBarData *currentData = [self currentData];
@@ -721,6 +939,9 @@ static void SVPNLogData(NSString *tag, id data) {
         // → 连上能染色、断开不恢复。
         STStatusBarDataEntry *vpnNow = data.vpnEntry;
         if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }
+        // 2.1-10：状态可能刚从「染」变成「不染」，此时桌面那套常驻视图
+        // 不会被系统重新下发样式，必须自己把颜色擦回去。
+        SVPNNoteDecisionTransition();
 
     #if SVPN_DIAG
         STStatusBarData *currentData = [self currentData];
@@ -850,8 +1071,15 @@ static void SVPNLogData(NSString *tag, id data) {
 - (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
     BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
     if (decision && IsNetworkTypeText(self.text)) {
+        // ★ 必须在 copy 之前读：改的是副本，self 拿到的原始 styleAttrs 没动，
+        //   它才是系统本来要用的色。
+        UIColor *sysTextColor = styleAttrs.textColor;
         styleAttrs = [styleAttrs copy];
-        [styleAttrs setTextColor:svpnColorWithTextColor(styleAttrs.textColor)];
+        UIColor *paint = svpnColorWithTextColor(sysTextColor);
+        [styleAttrs setTextColor:paint];
+        // 2.1-10：记下系统色与我们染的色，断开时据此还原
+        SVPNRememberOriginal(self, @"tc", sysTextColor);
+        SVPNRememberPainted(self, @"tc", paint);
     }
 
     %orig;
@@ -863,7 +1091,14 @@ static void SVPNLogData(NSString *tag, id data) {
 
     BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
     if (decision && IsNetworkTypeText(text)) {
-        [self setTextColor:svpnColorWithTextColor(self.textColor)];
+        // ★ 这里读的 self.textColor 不一定是系统色：setText: 之后 self.textColor
+        //   可能还留着上一轮染上的绿。SVPNRememberOriginal 内部会拿它和
+        //   「上次染的色」比对，相同就拒绝记账，避免把绿色当系统色存下来。
+        UIColor *cur = self.textColor;
+        UIColor *paint = svpnColorWithTextColor(cur);
+        [self setTextColor:paint];
+        SVPNRememberOriginal(self, @"tc", cur);
+        SVPNRememberPainted(self, @"tc", paint);
     }
 
     [self svpnApply5GAdvancedAttributesIfNeeded];
@@ -891,7 +1126,11 @@ static void SVPNLogData(NSString *tag, id data) {
 #endif
 
     if (decision) {
-        activeColor = svpnColorWithTextColor(activeColor);
+        // 入参就是系统本来要用的色 → 记账必须在改入参之前
+        SVPNRememberOriginal(self, @"ac", activeColor);
+        UIColor *paint = svpnColorWithTextColor(activeColor);
+        SVPNRememberPainted(self, @"ac", paint);
+        activeColor = paint;
     }
 
     %orig;
@@ -900,7 +1139,10 @@ static void SVPNLogData(NSString *tag, id data) {
 - (void)setInactiveColor:(UIColor *)inactiveColor {
     BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
     if (decision) {
-        inactiveColor = [svpnColorWithTextColor(inactiveColor) colorWithAlphaComponent:0.2];
+        SVPNRememberOriginal(self, @"ic", inactiveColor);
+        UIColor *paint = [svpnColorWithTextColor(inactiveColor) colorWithAlphaComponent:0.2];
+        SVPNRememberPainted(self, @"ic", paint);
+        inactiveColor = paint;
     }
 
     %orig;
@@ -926,9 +1168,15 @@ static void SVPNLogData(NSString *tag, id data) {
 
     if (decision) {
         styleAttrs = [styleAttrs copy];
-        UIColor *newColor = svpnColorWithTextColor(styleAttrs.textColor);
+        // 同上：copy 之后 textColor 取自副本，但副本的 textColor 就是系统原值
+        UIColor *sysColor = styleAttrs.textColor;
+        UIColor *newColor = svpnColorWithTextColor(sysColor);
         [styleAttrs setImageTintColor:newColor];
         [styleAttrs setImageDimmedTintColor:[newColor colorWithAlphaComponent:0.2]];
+        // 2.1-10：蜂窝图标走的是 styleAttrs 的 tint，还原时按「视图 + slot」回写。
+        //   styleAttrs 是临时对象，还原需要落到具体视图上，所以 key 用 self。
+        SVPNRememberOriginal(self, @"tint", sysColor);
+        SVPNRememberPainted(self, @"tint", newColor);
     }
 
     %orig;
