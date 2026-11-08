@@ -2,10 +2,11 @@
 
 三段式：① 断言注入真的发生了（文件字节变了）
         ② 断言「是哪条判据拦下的」（不能只看退出码非 0）
-        ③ finally 还原，全部跑完再复跑一次自检，确认干净
+        ③ finally 还原全部文件，跑完再复跑一次自检，确认干净
 
-★ 就地改 SingleVPN.x，不复制 /tmp（Git Bash 下 /tmp 映射异常，
+★ 就地改文件，不复制 /tmp（Git Bash 下 /tmp 映射异常，
   曾出现 cp 失败但脚本继续跑、反向验证实际测的是原文件的事故）。
+★ 覆盖两个文件：SingleVPN.x（代码闸门）与 devkit/mkdeb.sh（装包红线闸门）。
 """
 import io
 import os
@@ -13,11 +14,14 @@ import subprocess
 import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(_REPO, "SingleVPN.x")
 CHECK = os.path.join(_REPO, "tools", "check_source.py")
 PY = sys.executable
 
-_orig = io.open(SRC, encoding="utf-8", newline="").read()
+FILES = {
+    "x": os.path.join(_REPO, "SingleVPN.x"),
+    "mk": os.path.join(_REPO, "devkit", "mkdeb.sh"),
+}
+_orig = {k: io.open(p, encoding="utf-8", newline="").read() for k, p in FILES.items()}
 
 
 def run_check():
@@ -25,19 +29,15 @@ def run_check():
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
-def mutate(m):
-    """返回 (变异后文本, 注入标记)；标记用于确认注入真的发生。"""
-    return m(_orig)
-
-
-def one_replace(name, old, new, expect_gate, count=1):
+def one_replace(name, old, new, expect_gate, count=1, file="x"):
     def fn(s):
         assert s.count(old) == count, "%s 锚点命中 %d 次（期望 %d）" % (name, s.count(old), count)
         return s.replace(old, new, count)
-    return (name, fn, expect_gate)
+    return (name, file, fn, expect_gate)
 
 
 CASES = [
+    # ---- SingleVPN.x：启动闸门 / 诊断 / 条件块 ----
     one_replace("A8 诊断被误开", "#define SVPN_DIAG 0", "#define SVPN_DIAG 1",
                 "SVPN_DIAG 为 0"),
     one_replace("A18a 启动窗口缩到 1 秒", "#define SVPN_READY_DELAY_SEC 5",
@@ -51,8 +51,6 @@ CASES = [
                 "A18c ctor 里用 dispatch_after"),
     one_replace("A18c 闸门永远是关的", "gSVPNReady = 1;", "gSVPNReady = 0;",
                 "A18c ctor 里用 dispatch_after"),
-    # 把第一个数据层 hook 的「闸门闭合」与 %orig 交换 → %orig 落进闸门内
-    # （A1 括号仍配平，只有 A18d 该报）
     one_replace("A18d %orig 落进闸门内（窗口内连系统更新都被跳过）",
                 "    }\n    %orig;\n}\n\n- (void)_updateWithData:",
                 "    %orig;\n    }\n}\n\n- (void)_updateWithData:",
@@ -81,24 +79,51 @@ CASES = [
                 "    }\n    %orig;\n}\n\n- (void)_updateWithData:",
                 "    }\n    // orig removed\n}\n\n- (void)_updateWithData:",
                 "A19c 关掉诊断后功能骨架完整"),
+
+    # ---- devkit/mkdeb.sh：装包红线 ----
+    one_replace("A20 postinst 混入 sbreload（会杀前台 Sileo → 半装）",
+                "printf '\\n'\nexit 0\nEOF",
+                "printf '\\n'\nif [ -x /usr/bin/sbreload ]; then /usr/bin/sbreload; fi\nexit 0\nEOF",
+                "A20 postinst 不执行 sbreload", file="mk"),
+    one_replace("A20 postinst 混入 killall SpringBoard",
+                "printf '\\n'\nexit 0\nEOF",
+                "printf '\\n'\nkillall SpringBoard || true\nexit 0\nEOF",
+                "A20 postinst 不执行 killall", file="mk"),
+    one_replace("A21a _tar 不再跳过 DEBIAN（data.tar 会解到只读根）",
+                "dirs[:] = [d for d in dirs if d != 'DEBIAN']",
+                "dirs[:] = [d for d in dirs]",
+                "A21a _tar() 跳过 DEBIAN", file="mk"),
+    one_replace("A21b 构建期解包回验闸门被删",
+                "    raise SystemExit('data.tar 含 DEBIAN 条目，装包会炸: %s' % _bad[:5])",
+                "    pass  # 闸门被删",
+                "A21b 有构建期闸门解包回验", file="mk"),
+    one_replace("A17 写模式 tar 丢了 format（会产出 PAX 头）",
+                "with tarfile.open(fileobj=buf, mode='w', format=tarfile.GNU_FORMAT) as tf:",
+                "with tarfile.open(fileobj=buf, mode='w') as tf:",
+                "mkdeb.sh 写模式的 tarfile.open 都指定了 format", file="mk"),
 ]
 
 
+def restore_all():
+    for k, p in FILES.items():
+        io.open(p, "w", encoding="utf-8", newline="").write(_orig[k])
+
+
 def main():
-    # 前置：干净态必须全绿，否则反向验证没有意义
     rc, out = run_check()
     assert rc == 0, "干净态自检就挂了，先修：\n" + out[-1500:]
     print("前置：干净态自检全绿 ✓\n")
 
     passed = 0
     try:
-        for name, fn, expect in CASES:
-            mutated = fn(_orig)
-            assert mutated != _orig, "%s：注入没改变文件（反向验证会失真）" % name
-            io.open(SRC, "w", encoding="utf-8", newline="").write(mutated)
+        for name, fk, fn, expect in CASES:
+            path = FILES[fk]
+            mutated = fn(_orig[fk])
+            assert mutated != _orig[fk], "%s：注入没改变文件（反向验证会失真）" % name
+            io.open(path, "w", encoding="utf-8", newline="").write(mutated)
             # ① 确认注入真的落盘
-            on_disk = io.open(SRC, encoding="utf-8", newline="").read()
-            assert on_disk == mutated, "%s：注入没写进磁盘" % name
+            assert io.open(path, encoding="utf-8", newline="").read() == mutated, \
+                "%s：注入没写进磁盘" % name
             # ② 断言是哪条判据拦下的
             rc, out = run_check()
             fail_block = out.split("失败：")[-1] if "失败：" in out else ""
@@ -106,19 +131,19 @@ def main():
             assert expect in fail_block, (
                 "%s：该报的是「%s」，实际失败列表：\n%s" % (name, expect, fail_block[:600]))
             # ③ 还原并确认干净
-            io.open(SRC, "w", encoding="utf-8", newline="").write(_orig)
+            restore_all()
             rc2, out2 = run_check()
             assert rc2 == 0, "%s：还原后自检仍挂：\n%s" % (name, out2[-800:])
-            print("  ✓ %-38s 已拦下（%s）" % (name, expect))
+            print("  ✓ %-44s 已拦下（%s）" % (name, expect))
             passed += 1
     finally:
-        # 无论中途哪一步炸了，都必须还原源文件
-        io.open(SRC, "w", encoding="utf-8", newline="").write(_orig)
+        restore_all()
 
     rc, out = run_check()
     assert rc == 0, "最终复跑不干净：\n" + out[-1200:]
-    assert io.open(SRC, encoding="utf-8", newline="").read() == _orig, "源文件没还原"
-    print("\n✓ 反向验证全过（%d 例，零 SKIP），源文件已还原且复跑干净" % passed)
+    for k, p in FILES.items():
+        assert io.open(p, encoding="utf-8", newline="").read() == _orig[k], "文件没还原: " + k
+    print("\n✓ 反向验证全过（%d 例，零 SKIP），两个文件均已还原且复跑干净" % passed)
 
 
 if __name__ == "__main__":

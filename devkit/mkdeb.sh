@@ -67,9 +67,10 @@ chmod 644 "$STAGE/DEBIAN/control"
 cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
-if [ -d /Library/MobileSubstrate/DynamicLibraries ]; then :; fi
-# RootHide 下由 dpkg 以 root 运行，可以安全重建图标缓存
-if [ -x /usr/bin/sbreload ]; then /usr/bin/sbreload >/dev/null 2>&1 || true; fi
+printf '\n'
+printf 'SingleVPN 2.1-8 已安装。\n'
+printf '生效方式：装完后手动重启一次桌面即可。\n'
+printf '\n'
 exit 0
 EOF
 chmod 755 "$STAGE/DEBIAN/postinst"
@@ -115,6 +116,12 @@ def _tar():
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode='w', format=tarfile.GNU_FORMAT) as tf:
         for root, dirs, files in os.walk(stage):
+            # ★★ data.tar 绝不能带 DEBIAN/：dpkg 只从 control.tar.gz 读控制文件，
+            #   data.tar 里这份会解到根目录 /DEBIAN/。rootless / RootHide 上
+            #   根文件系统只读 → 解包失败 → 整个包装不上。
+            #   （NoLockWallpaper 1.2-1 的真实事故，同类脚本务必抄这条。）
+            if os.path.abspath(root) == os.path.abspath(stage):
+                dirs[:] = [d for d in dirs if d != 'DEBIAN']
             dirs.sort()
             files.sort()
             for name in dirs:
@@ -157,7 +164,16 @@ def _is_exec(rel):
 
 
 # data.tar 用 xz（与 Theos 产物一致）
-data = lzma.compress(_tar(), format=lzma.FORMAT_XZ)
+data_raw = _tar()
+# 构建期闸门：解回来逐成员确认 DEBIAN/ 真的没混进 data.tar。
+# 只靠「源码里写了 skip」不算证据 —— 改实现的人可能把那行挪走。
+_chk = tarfile.open(fileobj=io.BytesIO(data_raw), mode='r:')
+_bad = [m.name for m in _chk.getmembers()
+        if m.name.lstrip('./').startswith('DEBIAN/') or m.name.rstrip('/') == './DEBIAN']
+_chk.close()
+if _bad:
+    raise SystemExit('data.tar 含 DEBIAN 条目，装包会炸: %s' % _bad[:5])
+data = lzma.compress(data_raw, format=lzma.FORMAT_XZ)
 
 # control.tar 用 gz
 # ★ 同样必须 GNU_FORMAT：PAX 会给 control/postinst 也插 @PaxHeader，

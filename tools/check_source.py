@@ -625,11 +625,15 @@ if os.path.isfile(_mk):
     # 只在「引号外」的实代码里找 tarfile.open，注释与字符串里的举例不算
     _open_pos = _code_hits(_mk_txt, 'tarfile.open(')
     _calls = [_call_args(_mk_txt, p) for p, _ in _open_pos]
-    _no_fmt = [c for c in _calls if 'format=' not in c]
-    chk("mkdeb.sh 的 tarfile.open 都指定了 format",
-        bool(_calls) and not _no_fmt,
+    # ★ 只约束「写」：PAX 扩展头是写 tar 时才生成的。
+    #   读回验用 tarfile.open(..., mode='r:') 不需要 format，
+    #   把它算进来会假红（A21 加读回验闸门时踩过）。
+    _writes = [c for c in _calls if re.search(r"mode\s*=\s*['\"]w", c)]
+    _no_fmt = [c for c in _writes if 'format=' not in c]
+    chk("mkdeb.sh 写模式的 tarfile.open 都指定了 format",
+        bool(_writes) and not _no_fmt,
         ("%d 处未指定格式: %s" % (len(_no_fmt), _no_fmt[0][:60])) if _no_fmt
-        else "%d 处全部显式指定" % len(_calls))
+        else "%d 处全部显式指定" % len(_writes))
     _has_gnu = bool(_code_hits(_mk_txt, 'tarfile.GNU_FORMAT'))
     chk("mkdeb.sh 使用 tarfile.GNU_FORMAT（不用 PAX）",
         _has_gnu,
@@ -726,6 +730,37 @@ chk("A19c 关掉诊断后功能骨架完整（7 hook / 15 orig / 染色 / 闸门
     and "dispatch_after(" in _kept_nc,
     "hook=%d orig=%d" % (len(re.findall(r"^%hook\s", _kept_nc, re.M)),
                          len(re.findall(r"%orig\b", _kept_nc))))
+
+print("\n[A20] postinst 不得炸装包环境")
+# ★ 这是本项目最高优先级红线：postinst 跑在 dpkg 事务最后一步，
+#   此刻前台 Sileo 还活着；任何重启桌面的动作都会把包管理器一起杀掉
+#   → status 没写、锁没释放 → 半装，之后连别的包都装不上。
+#   `|| true` 只兜得住返回码，兜不住进程被杀。
+# ★ 判据必须锚 here-doc 正文，且剔除 printf 行（提示文案里提到某个词
+#   不等于真会执行）—— 10-21 在别的项目踩过「注释/文案把禁项判成命中」。
+_mk20 = os.path.join(_REPO, 'devkit', 'mkdeb.sh')
+_raw20 = io.open(_mk20, encoding='utf-8').read() if os.path.isfile(_mk20) else ""
+_po = re.search(r"cat\s+>\s+\"?\$STAGE/DEBIAN/postinst\"?\s+<<\s*'EOF'\s*\n(.*?)\nEOF",
+                _raw20, re.S)
+_body20 = _po.group(1) if _po else ""
+_cmd20 = "\n".join(l for l in _body20.split("\n")
+                   if l.strip() and not l.strip().startswith(("printf", "echo", "#")))
+chk("A20a 能提取到 postinst 正文", bool(_po) and "exit 0" in _body20)
+for _w in ("sbreload", "killall", "respring", "launchctl"):
+    chk("A20 postinst 不执行 %s" % _w,
+        re.search(r"\b%s\b" % _w, _cmd20) is None)
+chk("A20 postinst 不碰 SpringBoard 进程",
+    "SpringBoard" not in _cmd20)
+
+print("\n[A21] data.tar 不得含 DEBIAN/")
+# dpkg 只从 control.tar.gz 读控制文件；data.tar 里那份会解到根 /DEBIAN/，
+# rootless / RootHide 上根只读 → 整个包装不上。
+chk("A21a _tar() 跳过 DEBIAN 顶层目录",
+    re.search(r"dirs\[:\]\s*=\s*\[[^\]]*!=\s*['\"]DEBIAN['\"]", _raw20) is not None)
+chk("A21b 有构建期闸门解包回验（不只靠源码里写了 skip）",
+    "data_raw" in _raw20
+    and "data.tar 含 DEBIAN 条目" in _raw20
+    and "_bad" in _raw20)
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
