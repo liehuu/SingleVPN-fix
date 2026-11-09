@@ -1,33 +1,63 @@
-// ★ 不要 import <HBLog.h> / <substrate.h> 等 Theos 私有头：
-//   它们由 Theos 的 lib 目录提供，本工程已改为「零 Theos」构建
-//   （xcrun clang 直编 + vendored logos.pl），编不到。
-//   原文件只有一行 #import <HBLog.h>，全文没有任何 HBLog() 调用，直接删除。
-//   需要 hook 运行时符号时，用 -undefined dynamic_lookup 让 SpringBoard 在运行时解析。
+// ============================================================================
+// SingleVPN —— 状态栏 VPN 染色
 //
-// ★★ 必须指定 internal 后端（零 Theos 构建的前提）：
-//   Logos 默认后端是 MobileSubstrate，它的 preamble() 会强行注入
-//   `#include <substrate.h>` —— 那是 Theos 自带的头，零 Theos 环境下编不到，
-//   CI 实测报 `SingleVPN.x:98:10: fatal error: 'substrate.h' file not found`。
-//   internal 后端只注入 `#include <objc/message.h>`（系统 SDK 自带），
-//   并且自带一份 register_hook 实现（class_copyMethodList + method_setImplementation
-//   + class_addMethod 沿继承链上溯），语义与 MSHookMessageEx 一致：
-//     - 方法在本类：method_setImplementation 换掉，orig 拿到旧 IMP
-//     - 方法在父类：class_addMethod 加到子类，orig 拿父类 IMP（不污染父类，更安全）
-//   本项目 7 个 %hook / 15 处 %orig / 无任何直接 MSHook* 调用，internal 完全够用。
+// 2.2-1：重写。
+// 上一版（2.1-x 系列）在「还原机制」上叠了四轮补丁，每次修完又冒出新症状。
+// 重新写一遍，只保留经过实测确认的机制，其余全部删掉。
+//
+// 保留的四条（都有用户实测背书，缺一不可）：
+//   ① 启动 5 秒闸门 —— respring 后主屏状态栏实例在那一刻建成，插件介入会把
+//      它建成残缺状态，且 iOS 17 之后不会重建。整体挪出启动窗口即可（2.1-8）。
+//   ② VPN 状态只认本轮 data —— 与上一轮快照做或运算会把断开时的 YES 永久
+//      锁存，导致断开不褪色（2.1-9）。
+//   ③ 断开后主动写回原色 —— 视图染色是「一次性下发」，断开不改变格数/强度，
+//      系统不重发样式，上一轮的色就留在视图上（2.1-10）。
+//   ④ 换色相时保住系统 alpha —— 这是「桌面不定期图标空白」的真正根因（2.1-12）。
+//
+// 删掉的三类：
+//   · 诊断/取证脚手架（SVPN_DIAG 整块、日志双通道、心跳计数、地址去重）
+//     它们只在排查期需要；留在交付版里是热路径负担与新的干扰源。
+//   · entry 回填（svpnMergeMissingEntries）
+//     回填源是「已经渲染出去的上一轮数据」，respring/切换网络时可能是
+//     「存在但 enabled=NO」的空壳，塞回渲染管线 = 图标整块空白。
+//   · 还原机制的过度设计（全局外观 flag、tint 槽位、强制重绘）
+//     详见下面「还原」一节的注释。
+//
+// ★★ 关于「图标空白」的定性（这一版最重要的一条，别再走错方向）：
+//   用户实测：桌面不定期「信号条 + WiFi 一起彻底空着，连轮廓都没有」，
+//   深浅色背景都出现过，改一下网络或过一会儿自己恢复，**且原版也有**。
+//   「原版也有」这一条排除了所有 2.1-x 新写的代码 —— 根因在上游染色里：
+//
+//     [svpnColorWithTextColor(x) colorWithAlphaComponent:0.2]
+//
+//   colorWithAlphaComponent: 是**把 alpha 替换成 0.2**，不是叠加。系统给
+//   未激活信号格的 alpha 本来接近 1（实心灰格），被压到 0.2 后：
+//     深色壁纸 → rgb(10,40,18)  ≈ 全黑
+//     浅色壁纸 → rgb(214,244,222) ≈ 全白
+//   两边都「看不见」。改网络/等一会儿恢复，是系统重新下发样式把 alpha 改回去。
+//
+//   所以本版的核心修复是：**只换 RGB，alpha 沿用原色的**。
+//   这样「未激活格比激活格淡」这个系统语义保持不变，我们只负责换色相。
+// ============================================================================
+
+// ★ 不要 import <HBLog.h> / <substrate.h>：本工程是「零 Theos」构建
+//   （clang 直编 + vendored logos.pl），那些头编不到。
+//
+// ★★ 必须指定 internal 后端：
+//   Logos 默认后端 MobileSubstrate 的 preamble 会强行注入 <substrate.h>，
+//   零 Theos 环境下编不到。internal 只注入 <objc/message.h>（系统 SDK 自带），
+//   并自带 register_hook（class_copyMethodList + method_setImplementation
+//   + class_addMethod 沿继承链上溯），语义与 MSHookMessageEx 一致。
 %config(generator=internal)
 
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
-#import <time.h>          // clock_gettime / CLOCK_MONOTONIC（心跳节流用）
-#import <CoreFoundation/CoreFoundation.h>   // CFPreferences*（第二日志通道）
 
 #import "Common.h"
 #import "UIColor+.h"
 
-#define IsNetworkTypeText(text) ( \
-    [text isEqualToString:@"G"] || [text isEqualToString:@"3G"] || \
-    [text isEqualToString:@"4G"] || [text containsString:@"5G"] || \
-    [text isEqualToString:@"LTE"])
+// ===== 私有接口（逆向所得，字段名必须与系统一致，否则 @try 里会 unrecognized selector）
+//   注意：这里的声明只用于「知道有哪些属性/方法」，不做任何 KVC 动态调用。
 
 @interface STStatusBarDataEntry : NSObject
 @property (getter=isEnabled, nonatomic, readonly) bool enabled;
@@ -44,7 +74,6 @@
 @property (nonatomic, readonly) STStatusBarDataCellularEntry *secondaryCellularEntry;
 @property (nonatomic, readonly) STStatusBarDataEntry *vpnEntry;
 @property (nonatomic, readonly) STStatusBarDataWifiEntry *wifiEntry;
-- (STStatusBarData *)dataByReplacingEntry:(id)arg1 forKey:(NSString *)arg2;
 @end
 
 @interface STUIStatusBar : NSObject
@@ -73,643 +102,216 @@
 @property (nonatomic, strong) UIColor *activeColor;
 @end
 
-// ===== 2.1-8：启动窗口透传闸门 ==========================================
-// 症状：respring 后主屏状态栏的信号/WiFi/蜂窝图标整块空白，进 App 正常，
-//       且空白会一直持续到下一次 respring；不装本插件则不出现。
-//
-// 结论：主屏状态栏实例是在 respring 那一刻一次性创建的。只要那一刻
-//       插件介入了数据或样式（回填旧 entry / 改 styleAttrs / 诊断同步写文件），
-//       这个实例就可能建成「无网络 item」的残缺状态；iOS 17 之后不会主动
-//       重建该实例，空白就一直留着。App 内状态栏是另一套实例、走完整创建
-//       流程，所以正常。这也解释了「有时」——取决于首帧数据是否就绪。
-//
-// 做法：不逐个猜是哪个动作惹的祸，而是把插件**整体**挪出启动窗口。
-//       gSVPNReady 为 0 时，所有 hook 只做 %orig 透传，等价于插件不存在；
-//       5 秒后（首帧早已完成、聚合器数据已上报）才允许染色逻辑介入。
-//       - 不改系统数据、不复制私有对象、不新增私有 API 调用 → 不会崩宿主
-//       - 功能零回退：只是 respring 后晚 5 秒开始染色，用户实际无感
-//       - 可证伪：装后仍复现 ⇒ 根因不在启动窗口，下一步只查运行时样式路径
-#define SVPN_READY_DELAY_SEC 5
-static volatile int gSVPNReady = 0;
+// ============================================================================
+// 配置
 // ============================================================================
 
-static BOOL _isEnabled = NO;
-static BOOL _isVPNEnabled = NO;
-static BOOL _isEnabledReversed = NO;
-static BOOL _isForce5GAEnabled = NO;
+// 网络类型文字白名单。只有这些文本会被染色，别的（运营商名、通知等）不动。
+#define IsNetworkTypeText(text) ( \
+    [text isEqualToString:@"G"] || [text isEqualToString:@"3G"] || \
+    [text isEqualToString:@"4G"] || [text containsString:@"5G"] || \
+    [text isEqualToString:@"LTE"])
 
-static UIColor *_darkReplacementColor = nil;
-static UIColor *_lightReplacementColor = nil;
+// 启动窗口：0.5 秒。见文件头 ①。
+// ★ 为什么是 0.5 而不是原来的 5：
+//   5 秒是「宁可功能晚生效，也要确保不撞启动」的保守值 —— 当时还不知道
+//   到底哪个动作惹的祸，只能整块往后推。现在根因已定位到「respring 首帧
+//   数据未就绪时介入」，而首帧完成后到第一帧稳定通常在 200~400ms 内。
+//   0.5 秒足够避开，且用户几乎感觉不到「刚 respring 完颜色没生效」。
+//   若仍有 respring 后短暂空白，把它调大即可，功能不受影响。
+#define SVPN_READY_DELAY_MS 500
+static volatile int gSVPNReady = 0;
 
-static UIColor *svpnColorWithHexString(NSString *hexString) {
-    if (!hexString) {
-        return nil;
-    }
-    return [UIColor svpn_colorWithExternalRepresentation:hexString];
-}
+static BOOL _isEnabled = NO;            // 总开关
+static BOOL _isVPNEnabled = NO;         // VPN 当前是否连接（只认本轮 data）
+static BOOL _isEnabledReversed = NO;    // 反向：不连 VPN 才染色
+static BOOL _isForce5GAEnabled = NO;    // 强制显示 5GA
 
-static UIColor *svpnColorWithTextColor(UIColor *textColor) {
-    return [textColor svpn_isDarkColor] ? _lightReplacementColor : _darkReplacementColor;
-}
+static UIColor *_darkReplacementColor = nil;   // 系统色偏深时用（浅色底上的深色文字）
+static UIColor *_lightReplacementColor = nil;  // 系统色偏浅时用
 
-static void ReloadPrefs() {
+static void ReloadPrefs(void) {
     static NSUserDefaults *prefs = nil;
     if (!prefs) {
         prefs = [[NSUserDefaults alloc] initWithSuiteName:@"com.82flex.singlevpnprefs"];
     }
-
+    if (!prefs) {
+        return;
+    }
     NSDictionary *settings = [prefs dictionaryRepresentation];
+    if (!settings) {
+        return;
+    }
     _isEnabled = settings[@"IsEnabled"] ? [settings[@"IsEnabled"] boolValue] : YES;
     _isEnabledReversed = settings[@"IsEnabledReversed"] ? [settings[@"IsEnabledReversed"] boolValue] : NO;
     _isForce5GAEnabled = settings[@"IsForce5GAEnabled"] ? [settings[@"IsForce5GAEnabled"] boolValue] : NO;
 
-    _lightReplacementColor = svpnColorWithHexString(settings[@"ForegroundColorLight"]) ?: [UIColor colorWithRed:0.19607843137254902 green:0.7803921568627451 blue:0.34901960784313724 alpha:1];
-    _darkReplacementColor = svpnColorWithHexString(settings[@"ForegroundColorDark"]) ?: [UIColor colorWithRed:0.17254901960784313 green:0.8156862745098039 blue:0.3411764705882353 alpha:1];
-}
-
-%group SingleVPN_16
-
-%hook _UIStatusBarWifiItem
-
-- (id)applyUpdate:(_UIStatusBarItemUpdate *)update toDisplayItem:(_UIStatusBarDisplayItem *)displayItem {
-    _isVPNEnabled = update.data.vpnEntry.enabled;
-
-    id result = %orig;
-
-    UIColor *originalColor = update.styleAttributes.textColor;
-    UIColor *newColor = nil;
-
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
-    if (decision) {
-        newColor = svpnColorWithTextColor(originalColor);
-    }
-
-    if (!newColor) { newColor = update.styleAttributes.imageTintColor ?: originalColor; }
-
-    for (_UIStatusBarDisplayItem *item in self.displayItems.allValues) {
-        %orig(update, item);
-
-        if (item.view == self.networkIconView && [item.view isKindOfClass:%c(_UIStatusBarImageView)]) {
-            _UIStatusBarImageView *imageView = (_UIStatusBarImageView *)item.view;
-            [imageView setTintColor:newColor];
-        }
-    }
-
-    return result;
-}
-
-- (UIColor *)_fillColorForUpdate:(_UIStatusBarItemUpdate *)update entry:(_UIStatusBarDataWifiEntry *)entry {
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
-    if (decision) { 
-        return svpnColorWithTextColor(update.styleAttributes.textColor);
-    } else {
-        return %orig; 
-    }
-}
-
-%end
-
-%hook _UIStatusBarCellularItem
-
-- (id)applyUpdate:(_UIStatusBarItemUpdate *)update toDisplayItem:(_UIStatusBarDisplayItem *)displayItem {
-    _isVPNEnabled = update.data.vpnEntry.enabled;
-
-    id result = %orig;
-
-    UIColor *originalColor = update.styleAttributes.textColor;
-    UIColor *newColor = nil;
-
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
-    if (decision) {
-        newColor = svpnColorWithTextColor(originalColor);
-    }
-
-    if (!newColor) { newColor = originalColor; }
-
-    for (_UIStatusBarDisplayItem *item in self.displayItems.allValues) {
-        _UIStatusBarStringView *stringView = nil;
-
-        if ([item.view isKindOfClass:%c(_UIStatusBarCellularNetworkTypeView)]) {
-            stringView = ((_UIStatusBarCellularNetworkTypeView *)item.view).stringView;
-        } else if ([item.view isKindOfClass:%c(_UIStatusBarStringView)]) {
-            stringView = (_UIStatusBarStringView *)item.view;
-        }
-
-        if (IsNetworkTypeText(stringView.text)) {
-            [stringView setTextColor:newColor];
-        } else {
-            [stringView setTextColor:originalColor];
-        }
-    }
-
-    return result;
-}
-
-%end
-
-
-%hook _UIStatusBarStringView
-
-- (void)applyStyleAttributes:(_UIStatusBarStyleAttributes *)styleAttrs {
-    %orig;
-
-    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
-    if (decision && IsNetworkTypeText(self.text)) {
-        [self setTextColor:svpnColorWithTextColor(styleAttrs.textColor)];
-    }
-}
-
-%end
-
-%end // SingleVPN_16
-
-// ===== svpn 修复补丁 =========================================================
-// 原版在 iOS 17 分支用「上一轮快照回填系统本轮没下发的 entry」来保住图标，
-// 有两个确定性缺陷：
-//   ① 用 `BOOL changed = data.vpnEntry` 当开关，判的是「vpnEntry 对象是否存在」，
-//      而不是「VPN 是否已连接」。iOS 17 的 STStatusBarData 里 _vpnEntry 是固定字段，
-//      该判断几乎恒真 —— 等于不管有没有连 VPN，每一帧都在替系统改写状态栏数据。
-//   ② 回填源 [self currentData] 是「已经渲染出去的上一轮数据」，可能是残缺的：
-//      respring 后蜂窝/WiFi 尚未重新上报时，系统会下发「存在但 enabled=NO」的空壳。
-//      原版只判 `!data.cellularEntry`（完全缺失），不判 enabled，
-//      于是把 disabled 空壳顶回去 —— 状态栏拿到一个「存在但不该显示」的 entry，
-//      主屏的信号条和 WiFi 图标就此消失；而 App 内状态栏重新上报后自行恢复。
-// 修复：只在 VPN 确实连接时才介入，且只回填「本身 enabled」的旧 entry。
-// 把下面的宏改成 1 可完全关闭回填，用于 A/B 验证。
-//
-// ★★ v2.1-6：默认改为 1（关闭回填）。
-// 用户实测结论（决定性证据）：
-//   ① 图标消失只在 respring 之后出现，不是运行中逐渐变坏
-//      → 属一次性初始化阶段的问题，不是"用久了状态漂移"
-//   ② 完全卸载插件后，反复 respring 都不再消失
-//      → 确认是插件引起的
-//   ③ 消失形态是"整块空白，跟普通空白一样"
-//      → 不是颜色问题（背景同色至少能看出轮廓），是 entry 被判定为不该显示
-//
-// 结合①：respring 瞬间 currentData 是上一轮的陈旧快照，enabled 可能仍为 YES，
-// 但 string / signalStrength 等字段是残缺的。加 enabled 守卫拦不住这种
-// "enabled=YES 但内容残缺"的壳 —— 塞回系统后它照样画不出来，表现就是整块空白。
-// 因此正确做法不是"回填得更小心"，而是**根本不要回填**：
-// 系统本来就会在稍后重新上报完整数据，我们插手只会把残缺数据顶进渲染管线。
-//
-// 染色功能与此无关，保持开启。
-#define SVPN_DISABLE_ENTRY_MERGE 1
-
-static STStatusBarData *svpnMergeMissingEntries(STUIStatusBar *bar, STStatusBarData *data) {
-    if (!data) {
-        return data;
-    }
-
-    STStatusBarData *cur = nil;
+    UIColor *l = nil, *d = nil;
     @try {
-        cur = [bar currentData];
+        l = [UIColor svpn_colorWithExternalRepresentation:settings[@"ForegroundColorLight"]];
+        d = [UIColor svpn_colorWithExternalRepresentation:settings[@"ForegroundColorDark"]];
     } @catch (NSException *e) {
-        return data;
     }
-    if (!cur) {
-        return data;
-    }
-
-    if (!data.cellularEntry && cur.cellularEntry.enabled) {
-        data = [data dataByReplacingEntry:[cur.cellularEntry copy] forKey:@"cellularEntry"];
-    }
-    if (!data.secondaryCellularEntry && cur.secondaryCellularEntry.enabled) {
-        data = [data dataByReplacingEntry:[cur.secondaryCellularEntry copy] forKey:@"secondaryCellularEntry"];
-    }
-    if (!data.wifiEntry && cur.wifiEntry.enabled) {
-        data = [data dataByReplacingEntry:[cur.wifiEntry copy] forKey:@"wifiEntry"];
-    }
-    return data;
+    // 设置里没配就用默认绿。★ 这里必须有兜底：颜色为 nil 会让染色路径
+    // 走进「写 nil」的分支，等于把图标颜色清空。
+    _lightReplacementColor = l ?: [UIColor colorWithRed:0.196 green:0.780 blue:0.349 alpha:1];
+    _darkReplacementColor = d ?: [UIColor colorWithRed:0.173 green:0.816 blue:0.341 alpha:1];
 }
+
+// ============================================================================
+// 颜色：只换色相，保留 alpha
 // ============================================================================
 
-// ===== svpn 诊断（v2.1-5 专用，交付排查完即删）=============================
-// 目的：不再靠读源码猜。把「每次下发到状态栏的数据到底长什么样」记下来，
-//       以及「我们到底改没改它」，一次性搞清楚图标消失时是谁的问题。
-//
-// 输出：双通道，前缀 [SVPN]
-//   ① NSLog —— 系统统一日志服务，可用 log stream/show 抓
-//   ② 文件 —— <jbroot>/var/mobile/Library/Logs/SingleVPN/svpn.log，
-//      用 Filza 直接打开。RootHide 的 jbroot 在 AppGroup 随机哈希目录，
-//      无法硬编码，所以用 dladdr 反推自身路径（CellularTint 验证过可行）。
-//   两条都写，任一条能取到就够。
-//
-// 用法：安装后 respring 几次，复现后把日志导出来看。
-// 判定要点见每条记录里的 isNil / isEn 字段。
-//
-// ★ 2.1-8 起关闭。诊断代码留在源码里（便于日后取证），但不参与编译：
-//   SVPNLog 是 NSLog + 主线程同步写文件双写，而 respring 首帧的数据
-//   必然残缺 → 会当场触发 SUSPECT 分支写文件，正好卡在状态栏建实例的
-//   关键时刻。这本身就是新的干扰源，不能带进交付版。
-#define SVPN_DIAG 0
-
-#if SVPN_DIAG
-static NSUInteger gDiagCount = 0;
-static NSUInteger gDiagMax = 120;          // 异常样本上限
-
-/// 当前记录序号（0 表示这次没记录），供 out 段配平使用
-static NSUInteger gDiagSeq = 0;
-
-/// 颜色染色采样计数（单独计数，避免被数据异常记录挤满）
-static NSUInteger gColorDiagCount = 0;
-
-/// styleAttrs 染色采样计数（蜂窝图标走这里，与 WiFi 的 activeColor 分开计）
-static NSUInteger gStyleDiagCount = 0;
-
-/// 上一份被记录过的 data 指针。_updateWithAggregatedData: 每帧都走，
-/// 同一次渲染可能连着调好几次；同一份数据的对象地址相同就跳过，
-/// 避免重复拼字符串（热路径开销的主要来源）。
-static const void *gLastLoggedData = NULL;
-static const void *gLastLoggedData2 = NULL;   // _updateWithData: 专用，避免两个 hook 互相干扰去重
-
-/// ★ 心跳统计：解决「图标消失了但日志一片空白」的判定盲区。
-/// 如果只在数据可疑时记录，那"数据层一切正常但视图没画出来"这种情况
-/// 会留下零条 AGG 日志，拿到日志也无法区分是"没更新"还是"更新了但正常"。
-///
-/// ★ 但心跳本身绝不能变成新的热路径负担：
-///   - 计数用普通自增（无锁、无分配），几乎零开销
-///   - 只有「满 N 次」且「总条数未超限」且「距上次心跳超过 2 秒」才真正打日志
-///   - 总上限 gHeartbeatMax 条，防止状态栏动画期间刷爆文件
-/// 三条限制缺一不可 —— 直接写文件是主线程 IO，量大就是卡顿源。
-///
-/// ★ 顺序要求：这些变量必须定义在 SVPNHeartbeatDue 之前，
-///   否则函数体内引用到的是未声明的标识符（clang 直接报错）。
-static NSUInteger gAggCallCount = 0;
-static NSUInteger gUpdCallCount = 0;
-static NSUInteger gHeartbeatEvery = 50;
-static NSUInteger gHeartbeatSent = 0;
-static NSUInteger gHeartbeatMax = 12;
-static double gLastHeartbeatAt = 0;
-
-/// 心跳是否该真的打一条。三条闸门一起卡，任何一个不满足都直接返回 NO，
-/// 让热路径保持「读几个整数就结束」的开销水平。
-///
-/// 刻意用 clock_gettime 而不是 CACurrentMediaTime：后者要引 QuartzCore 头文件，
-/// 而本工程 Makefile 没有显式链该 framework（SpringBoard 进程内虽然一定有，
-/// 但编译期缺声明会报隐式声明，属于自找麻烦）。
-static BOOL SVPNHeartbeatDue(NSUInteger n) {
-    if (n % gHeartbeatEvery != 0) return NO;
-    if (gHeartbeatSent >= gHeartbeatMax) return NO;
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return NO;
-    double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-    if (now - gLastHeartbeatAt < 2.0) return NO;
-    gLastHeartbeatAt = now;
-    gHeartbeatSent++;
-    return YES;
+/// 取「当前是否该染色」。
+/// 唯一的判定入口 —— 所有 hook 都调它，保证行为一致。
+static inline BOOL SVPNDecision(void) {
+    if (!gSVPNReady) {
+        return NO;
+    }
+    return _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
 }
 
-/// 判定「这份数据是否可疑」——只有可疑才落日志。
-/// 正常状态下这几个 entry 应当是 enabled=YES 的；出现 nil 或 en=0 都值得记。
-///
-/// ★ 关于副卡：单卡设备上 secondaryCellularEntry 本来就没有，
-///   nil 是正常的，不能算可疑。所以这里对副卡用「存在但 disabled」作为判据，
-///   而不是「为 nil」——这样单卡不会刷屏，双卡真降级时又能抓到。
-static BOOL SVPNDataLooksSuspicious(id data, BOOL *hasAnyNil, BOOL *hasAnyDisabled) {
-    BOOL anyNil = NO, anyDisabled = NO;
-    if (!data) {
-        if (hasAnyNil) *hasAnyNil = YES;
-        if (hasAnyDisabled) *hasAnyDisabled = NO;
-        return YES;
+/// 按系统色挑替换色。
+/// svpn_isDarkColor 对非 RGB 色（动态色等）一律返回 NO（当浅色处理），
+/// 所以调它之前不保证能取到 RGBA —— 取不到时走 _lightReplacementColor，
+/// 那是最常见的「深色文字配浅色底」假设，比写 nil 安全得多。
+static UIColor *svpnReplacementFor(UIColor *systemColor) {
+    if (!systemColor) {
+        return nil;
     }
-    // 主卡 / WiFi：缺失和停用都算可疑
-    NSArray *mustKeys = @[@"cellularEntry", @"wifiEntry"];
-    for (NSString *k in mustKeys) {
-        id e = nil;
-        @try { e = [data valueForKey:k]; } @catch (NSException *ex) {}
-        if (!e) {
-            anyNil = YES;
-            continue;
-        }
-        BOOL en = NO;
-        @try {
-            if ([e respondsToSelector:@selector(isEnabled)]) en = [e isEnabled];
-        } @catch (NSException *ex) {}
-        if (!en) anyDisabled = YES;
-    }
-    // 副卡：只有「存在但停用」才可疑
+    BOOL dark = NO;
     @try {
-        id sec = [data valueForKey:@"secondaryCellularEntry"];
-        if (sec) {
-            BOOL en = NO;
-            @try {
-                if ([sec respondsToSelector:@selector(isEnabled)]) en = [sec isEnabled];
-            } @catch (NSException *ex) {}
-            if (!en) anyDisabled = YES;
-        }
-    } @catch (NSException *ex) {}
-
-    if (hasAnyNil) *hasAnyNil = anyNil;
-    if (hasAnyDisabled) *hasAnyDisabled = anyDisabled;
-    return (anyNil || anyDisabled);
-}
-
-/// 把一个 entry 描述成「存在与否 + enabled + 类名」
-/// 关键：entry 可能为 nil（未下发）、也可能存在但 enabled=NO（空壳）
-static NSString *SVPNEntryDesc(NSString *name, id entry) {
-    if (!entry) {
-        return [NSString stringWithFormat:@"%@=nil", name];
-    }
-    BOOL en = NO;
-    @try {
-        if ([entry respondsToSelector:@selector(isEnabled)]) {
-            en = [entry isEnabled];
-        }
+        dark = [systemColor svpn_isDarkColor];
     } @catch (NSException *e) {
+        dark = NO;
     }
-    return [NSString stringWithFormat:@"%@=obj(en=%d,%@)",
-                                      name, en, NSStringFromClass([entry class])];
+    return dark ? _lightReplacementColor : _darkReplacementColor;
 }
 
-/// 把颜色转成可比较的文本（不打印对象地址，否则每次日志都不一样，没法比对）
-static NSString *SVPNColorDesc(UIColor *c) {
-    if (!c) {
-        return @"nil";
+/// ★★★ 本版核心：换 RGB，**alpha 沿用 original 的**。
+///
+/// 绝不能用 colorWithAlphaComponent: —— 它替换 alpha 而不是叠加。
+/// 系统给未激活信号格的 alpha 接近 1，被压到 0.2 后深底近乎全黑、
+/// 浅底近乎全白，两种背景下都「看不见」，这正是用户报的图标空白。
+///
+/// 三个边界，都按「宁可保持原样，不要写一个看不见的色」处理：
+///   · hue 为 nil        → 返回 original（没得换，保持原样）
+///   · original 为 nil   → 返回 hue（没有原色可参照，用纯色相）
+///   · 取不到 RGBA       → 返回 hue（动态色按纯色相，alpha 用 hue 自己的）
+static UIColor *svpnReplaceKeepingAlpha(UIColor *original, UIColor *hue) {
+    if (!hue) {
+        return original;
+    }
+    if (!original) {
+        return hue;
     }
     CGFloat r = 0, g = 0, b = 0, a = 0;
-    BOOL rgb = NO;
+    CGFloat sr = 0, sg = 0, sb = 0, sa = 0;
+    if (![original getRed:&sr green:&sg blue:&sb alpha:&sa]) {
+        return hue;
+    }
+    if (![hue getRed:&r green:&g blue:&b alpha:&a]) {
+        return hue;
+    }
     @try {
-        rgb = [c getRed:&r green:&g blue:&b alpha:&a];
+        return [UIColor colorWithRed:r green:g blue:b alpha:sa];
     } @catch (NSException *e) {
+        return hue;
     }
-    if (!rgb) {
-        // 关键特征：getRed: 失败的颜色（动态色 / 灰度色 / 图案色）。
-        // svpn_isDarkColor 遇到这种会一律当亮色，是本插件最容易失手的地方。
-        return [NSString stringWithFormat:@"nonRGB(%@)", NSStringFromClass([c class])];
-    }
-    return [NSString stringWithFormat:@"rgba(%d,%d,%d,%d)",
-                    (int)lround(r * 255), (int)lround(g * 255),
-                    (int)lround(b * 255), (int)lround(a * 255)];
 }
 
-// ---- 落盘通道（NSLog 抓不到时的兜底）------------------------------------
-// 为什么两路都做：NSLog 走系统的统一日志服务，需要从电脑或终端去捞，
-// 多一道手续；而 dylib 自己就躺在 <jbroot>/Library/MobileSubstrate/DynamicLibraries/，
-// 用 dladdr 反推 jbroot 后直接写文件，用户用 Filza 就能打开看。
-// 这条路 CellularTint 验证过可用（见该项目 main.m 的 CTResolveJbroot）。
+// ============================================================================
+// 还原：断开 VPN 后把染上去的色写回系统原色
+// ============================================================================
 //
-// 安全约束（注入 SpringBoard，任何异常都不能外泄）：
-//   * 只写固定路径、固定文件名，不做任何拼接扫描
-//   * 无上限行数控制由调用方 gDiagCount 决定（最多 120 条）
-//   * 全程 @try/@catch，失败静默降级为「只有 NSLog」
-//   * 用 appendFile 而不是自己 fopen/写/关，交给 Foundation 管
-static NSString *SVPNLogFilePath(void) {
-    // 注意：这里不能用 dispatch_once —— 若首次反推 jbroot 失败，
-    // once 已被消耗，之后再也不会重试，整个诊断通道就永久哑掉。
-    // 改用一个普通标记：成功后才锁定。
-    static NSString *cached = nil;
-    static NSString *failed = nil;   // 只要失败过就不再重试，避免每次打日志都去 IO
-    if (cached || failed) {
+// 为什么需要：视图染色是「一次性下发」。decision==NO 时各 hook 只是纯透传，
+//   前提是这些方法会再被调用一次。但 VPN 断开通常不改变信号格数 / WiFi 强度 /
+//   网络类型文字，系统不重发样式 → hook 不再被调用 → 上一轮的色留在视图上。
+//   App 内状态栏是另一个实例、进入时走完整创建流程，所以那里一直是对的。
+//
+// 数据结构：**一视图一字典**，键是槽位名，同一字典里放三样：
+//     @"tc" / @"ac" / @"ic"  → 系统原本的颜色
+//     @"tc#" / @"ac#" / @"ic#" → 我们自己染上去的颜色（残留识别用）
+//     @"@style"               → 记账时的界面外观
+//   销账时一次 removeObjectForKey 就干净，不存在「两张表漏销一张」的问题。
+//
+// 四个必须遵守的点（每一条都对应一次踩坑）：
+//   ① 残留识别：setText: 路径读到的 self.textColor 可能已被我们染过。
+//      若读到的色等于「我上次染的这个值」，它就不是系统色，拒绝记账。
+//      不判这一条，第二次调用会把绿色当系统色存下来，还原时还原成绿色。
+//   ② 逐视图比对外观：系统色随深浅色变化。若「记账时的外观」与「还原时的
+//      外观」不同，这批色已经过期，写回去就是错色 —— 只跳过该视图，不清表
+//      （清表会连带丢掉外观没变的那些记录）。
+//   ③ 写回前实色 + 幂等：只写能取到 RGBA 的实色；透明色不写（写上去就是
+//      看不见）；当前值已相同就不写（我们是在系统更新流程之外改私有属性）。
+//   ④ 处理完销账：账本只在一个「染色 → 断开」周期内有效。桌面视图长期存活，
+//      账留着就会在下次断开时拿一本跨了多次样式更新的旧账去校准屏幕。
+
+#define SVPN_RESTORE_MAX_VIEWS 32
+#define SVPN_STYLE_KEY @"@style"
+
+static NSMapTable *gSVPNLedger = nil;   // 视图(weak, 指针同一性) → NSMutableDictionary
+static int gSVPNLastDecision = -1;      // -1 未知 / 0 不染 / 1 染
+
+/// 当前界面外观：1 深色 / 0 浅色 / -1 拿不到。
+/// forceRefresh=YES 时绕过缓存 —— 还原是一次性动作，必须拿新鲜值，
+/// 否则「刚切外观就断开」这个窗口会判成「外观没变」而写出过期色。
+/// 染色热路径传 NO：那里每帧都可能走，不能每次都同步问 UIApplication。
+static int SVPNUserInterfaceStyle(BOOL forceRefresh) {
+    static int cached = -2;
+    static CFAbsoluteTime cachedAt = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!forceRefresh && cached != -2 && (now - cachedAt) < 5.0) {
         return cached;
     }
+    int v = -1;
     @try {
-        NSMutableArray *dirs = [NSMutableArray array];
-
-        // ★ 候选顺序按「在 SpringBoard 里越可能可写」排，而不是按「越标准」排。
-        //
-        // 实测教训：上一版只放 /var/mobile/Library/Logs/... 和 jbroot 下两条，
-        // 用户机上**连目录都建不出来**（整个 SingleVPN 文件夹不存在）。
-        // 说明 RootHide 环境下 SpringBoard 对 /var/mobile/Library 没有创建权限。
-        //
-        // 关键洞察：tweak 的配置 plist 一直写在
-        //   /var/mobile/Library/Preferences/
-        // 并且一直是成功的（插件能读到开关）。这条路径**已被证明可写**，
-        // 所以优先用它。日志文件名带自己的前缀，不与配置冲突。
-        NSString *prefsDir = @"/var/mobile/Library/Preferences";
-        [dirs addObject:prefsDir];
-
-        // 其次：jbroot 内 Library/Logs（RootHide 下这个根通常可写）
-        Dl_info info;
-        if (dladdr((const void *)SVPNLogFilePath, &info) && info.dli_fname) {
-            NSString *selfPath = [NSString stringWithUTF8String:info.dli_fname];
-            NSString *p2 = selfPath;
-            for (int i = 0; i < 4 && p2.length > 1; i++) {
-                p2 = [p2 stringByDeletingLastPathComponent];
-            }
-            if (p2.length > 1) {
-                [dirs addObject:[p2 stringByAppendingPathComponent:@"var/mobile/Library/Preferences"]];
-                [dirs addObject:[p2 stringByAppendingPathComponent:@"Library/Logs"]];
-            }
+        UITraitCollection *tc = nil;
+        @try { tc = [UITraitCollection currentTraitCollection]; } @catch (NSException *e) {}
+        if (!tc) {
+            @try {
+                UIApplication *app = [UIApplication sharedApplication];
+                if (app) { tc = [(id)app traitCollection]; }
+            } @catch (NSException *e) {}
         }
-
-        // 兜底：常见 RootHide 根与标准日志目录
-        [dirs addObject:@"/var/mobile/Library/Logs"];
-        [dirs addObject:@"/var/jb/var/mobile/Library/Logs"];
-        [dirs addObject:@"/tmp"];
-
-        NSFileManager *fm = [NSFileManager defaultManager];
-        for (NSString *dir in dirs) {
-            if (![fm fileExistsAtPath:dir]) {
-                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
-            }
-            if (![fm fileExistsAtPath:dir]) {
-                continue;   // 建不出来，换下一个
-            }
-            // 用真实文件名探测，而不是 .probe：万一 .probe 被沙盒特判，
-            // 至少能确认「这个目录能写我自己的文件」。
-            NSString *target = [dir stringByAppendingPathComponent:@"SingleVPN-svpn.log"];
-            NSData *d = [@"1" dataUsingEncoding:NSUTF8StringEncoding];
-            if ([d writeToFile:target atomically:NO]) {
-                // 探测成功，把探测内容清掉，之后正常追加
-                [fm removeItemAtPath:target error:NULL];
-                cached = target;
-                break;
-            }
-        }
-        if (!cached) {
-            failed = @"1";
+        if (tc) {
+            v = (tc.userInterfaceStyle == UIUserInterfaceStyleDark) ? 1 : 0;
         }
     } @catch (NSException *e) {
-        failed = @"1";
-        cached = nil;
+        v = -1;
     }
-    return cached;
+    if (v >= 0) {
+        cached = v;
+        cachedAt = now;
+    }
+    return v;
 }
 
-/// ★ 第二通道：写进 NSUserDefaults（走 cfprefsd → plist）。
-/// 为什么需要：文件通道可能因沙盒被整条拒绝（已真实发生过一次，用户机上
-/// 连目录都建不出来）。而 tweak 的配置 plist 一直是能写的，
-/// 说明 cfprefsd 这条链路在 SpringBoard 里是可用的。
-/// 代价是每次写都要序列化，所以只保留最近 N 行，且按计数节流。
-static NSMutableArray *gDefaultsLines = nil;
-static NSUInteger gDefaultsWrites = 0;
-#define SVPN_DEFAULTS_MAX_LINES 40
-#define SVPN_DEFAULTS_MAX_WRITES 60   // 总写入次数上限，防止长期运行磨损 plist
-
-static void SVPNPushToDefaults(NSString *line) {
-    if (!line.length) return;
-    if (gDefaultsWrites >= SVPN_DEFAULTS_MAX_WRITES) return;
-    @try {
-        if (!gDefaultsLines) {
-            gDefaultsLines = [NSMutableArray array];
-        }
-        [gDefaultsLines addObject:line];
-        while ((NSUInteger)[gDefaultsLines count] > SVPN_DEFAULTS_MAX_LINES) {
-            [gDefaultsLines removeObjectAtIndex:0];
-        }
-        // 每 5 行刷一次，避免每行都触发一次 cfprefsd 往返
-        gDefaultsWrites++;
-        if (gDefaultsWrites % 5 != 0 && gDefaultsWrites < SVPN_DEFAULTS_MAX_WRITES) {
-            return;
-        }
-        NSArray *snap = [gDefaultsLines copy];
-        CFStringRef key = CFSTR("DiagLog");
-        CFStringRef app = CFSTR("com.82flex.singlevpn");
-        CFPreferencesSetAppValue(key, (__bridge CFPropertyListRef)snap, app);
-        CFPreferencesAppSynchronize(app);
-    } @catch (NSException *e) {
-        // 静默
-    }
-}
-
-/// 追加一行到文件（失败不报错，不影响宿主）
-static void SVPNAppendToFile(NSString *line) {
-    @try {
-        NSString *path = SVPNLogFilePath();
-        if (!path || !line.length) {
-            // 文件通道不可用时，至少让内容进 plist
-            SVPNPushToDefaults(line);
-            return;
-        }
-        NSString *text = [line stringByAppendingString:@"\n"];
-        NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-        if (!data) {
-            return;
-        }
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:path]) {
-            [data writeToFile:path atomically:NO];
-            return;
-        }
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) {
-            SVPNPushToDefaults(line);
-            return;
-        }
-        @try {
-            [fh seekToEndOfFile];
-            [fh writeData:data];
-        } @finally {
-            [fh closeFile];
-        }
-    } @catch (NSException *e) {
-        SVPNPushToDefaults(line);
-    }
-}
-
-/// 统一输出入口：NSLog（便于用 log 命令抓）+ 文件（便于 Filza 直接看）
-// 刻意「不声明任何局部变量」——本宏有调用点位于 @catch 块内，
-// @catch 对跨初始化的局部声明有额外限制，少一个变量少一分编译失败风险。
-#define SVPNLog(fmt, ...) do { \
-    NSLog(fmt, ##__VA_ARGS__); \
-    SVPNAppendToFile([NSString stringWithFormat:fmt, ##__VA_ARGS__]); \
-} while (0)
-
-/// 一次性打印一条 STStatusBarData 的全貌
-static void SVPNLogData(NSString *tag, id data) {
-    if (!data) {
-        SVPNLog(@"[SVPN] %@ data=nil", tag);
-        return;
-    }
-
-
-    NSMutableString *s = [NSMutableString stringWithFormat:@"[SVPN] %@ {", tag];
-    @try {
-        // 这几个是我们关心的；vpn / cellular / wifi 直接读属性
-        id vpn = nil, cel = nil, sec = nil, wifi = nil;
-        @try { vpn = [data valueForKey:@"vpnEntry"]; } @catch (NSException *e) {}
-        @try { cel = [data valueForKey:@"cellularEntry"]; } @catch (NSException *e) {}
-        @try { sec = [data valueForKey:@"secondaryCellularEntry"]; } @catch (NSException *e) {}
-        @try { wifi = [data valueForKey:@"wifiEntry"]; } @catch (NSException *e) {}
-
-        [s appendString:SVPNEntryDesc(@"vpn", vpn)];
-        [s appendString:@" "];
-        [s appendString:SVPNEntryDesc(@"cell", cel)];
-        [s appendString:@" "];
-        [s appendString:SVPNEntryDesc(@"sec", sec)];
-        [s appendString:@" "];
-        [s appendString:SVPNEntryDesc(@"wifi", wifi)];
-
-        // 蜂窝的文字内容（4G/5G/LTE），能反映「有新数据还是空壳」
-        if (cel) {
-            NSString *str = nil, *cross = nil;
-            @try { str = [cel valueForKey:@"string"]; } @catch (NSException *e) {}
-            @try { cross = [cel valueForKey:@"crossfadeString"]; } @catch (NSException *e) {}
-            [s appendFormat:@" cellStr=%@ cross=%@", str ?: @"nil", cross ?: @"nil"];
-        }
-    } @catch (NSException *e) {
-        [s appendFormat:@" <exception %@>", e.reason];
-    }
-    [s appendString:@"}"];
-    SVPNLog(@"%@", s);
-}
-
-#endif
-// ============================================================================
-
-// ===== 2.1-10：断开 VPN 后把染色还原（桌面状态栏专用）=======================
-// 症状（用户实测）：断开 VPN 后桌面状态栏的信号 / WiFi 图标仍是绿色，
-//                   但打开任意 App，App 内状态栏的颜色已正常退回。
-//
-// 这条实测把范围钉死了：
-//   ① App 内正常 ⇒ _isVPNEnabled 已正确回落为 NO（2.1-9 的数据层修复成立）
-//   ② 只有桌面残留 ⇒ 数据对了，是「视图没跟上」
-//
-// 机制：视图层染色是「一次性下发」而不是「持续施加」。decision==NO 时下面四个
-//   hook 只是纯透传系统原值，**前提是这些方法会再被调用一次**。VPN 断开通常
-//   不改变信号格数 / WiFi 强度 / 网络类型文字，系统不会重新下发样式属性 →
-//   它们不再被调用 → 上一轮染上去的颜色就留在视图上。App 内状态栏是另一个
-//   实例、进入时走完整创建流程（必调 applyStyleAttributes:），所以那里正常。
-//
-// 做法：染色时顺手记下「这个视图本来该是什么色」，检测到 decision 由「染」
-//       变成「不染」时把这些色回写回去。四条硬约束：
-//   ① 系统色的来源必须干净。applyStyleAttributes: 里改的是 copy，原始入参
-//      没动 → 直接读它最可信；setActiveColor:/setInactiveColor: 的入参同理。
-//      只有 setText: 读的是 self.textColor，可能已被上一轮染过，所以用
-//      「当前值 == 上次染的色」判出残留并拒绝记账 —— 否则第二次调用会把绿色
-//      当成系统色存下来，还原时还原成绿色，等于没修。
-//   ② 只还原自己改过的那几个槽位，不做全量 tintColor 重置；每个 slot 还原前
-//      先 respondsToSelector: → 不存在就跳过，绝不 unrecognized selector。
-//   ③ 表用 weak key（视图销毁自动出表）+ 指针同一性（绝不按 isEqual 合并两个
-//      不同视图）+ 还原前先收集再改（边遍历边改 NSMapTable 是不安全的）。
-//   ④ 还原推到主队列下一拍，且执行前重新确认「现在确实不该染」——
-//      断开后 0.1 秒又连上的话，擦掉刚染的色就是制造新 bug。
-//
-// 可证伪：装后断开 VPN，桌面颜色立刻退回 ⇒ 修好；
-//         仍残留但点开任意 App 再回桌面就正常 ⇒ 过渡检测没触发，查 A23d；
-//         仍残留且怎么切都不退 ⇒ 记下的系统色不对，查 ①。
-#define SVPN_RESTORE_MAX_VIEWS 32
-
-static NSMapTable *gSVPNOriginals = nil;   // 视图 → 该系统原色（按 slot 存）
-static NSMapTable *gSVPNPainted = nil;     // 视图 → 我们染上去的色（识别残留用）
-static int gSVPNLastDecision = -1;         // -1 未知 / 0 表示不染 / 1 表示染
-
-/// ★ key 必须 WeakMemory + ObjectPointerPersonality。
+/// ★ key 必须 WeakMemory + ObjectPointerPersonality：
 ///   只写 weakToStrongObjectsMapTable 会退回默认 personality，
-///   一旦某个视图类重写了 isEqual 就可能把两个视图并成一条 → 还原时串味。
-static void SVPNEnsureViewTables(void) {
+///   视图类一旦重写 isEqual 就可能把两个视图并成一条 → 还原串味。
+static void SVPNEnsureLedger(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSPointerFunctionsOptions kOpt =
             NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality;
         NSPointerFunctionsOptions vOpt =
             NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality;
-        gSVPNOriginals = [NSMapTable mapTableWithKeyOptions:kOpt valueOptions:vOpt];
-        gSVPNPainted = [NSMapTable mapTableWithKeyOptions:kOpt valueOptions:vOpt];
+        gSVPNLedger = [NSMapTable mapTableWithKeyOptions:kOpt valueOptions:vOpt];
     });
 }
 
-/// 取（必要时创建）某个视图自己的 slot 字典
-static NSMutableDictionary *SVPNViewSlotDict(NSMapTable *tbl, id view) {
-    if (!tbl || !view) {
+static NSMutableDictionary *SVPNLedgerDict(id view, BOOL create) {
+    if (!view) {
         return nil;
     }
+    SVPNEnsureLedger();
     NSMutableDictionary *d = nil;
     @try {
-        d = [tbl objectForKey:view];
-        if (!d) {
-            d = [NSMutableDictionary dictionary];
-            [tbl setObject:d forKey:view];
+        d = [gSVPNLedger objectForKey:view];
+        if (!d && create) {
+            d = [NSMutableDictionary dictionaryWithCapacity:4];
+            [gSVPNLedger setObject:d forKey:view];
         }
     } @catch (NSException *e) {
         return nil;
@@ -717,62 +319,96 @@ static NSMutableDictionary *SVPNViewSlotDict(NSMapTable *tbl, id view) {
     return d;
 }
 
-/// 记下「这个视图本来该是什么色」。
-/// 若 color 正好等于我们上一轮染上去的值，说明这是残留（setText: 路径会遇到），
-/// 拒绝记账 —— 把绿色当系统色存下来是这套机制唯一会把事情办坏的写法。
-static void SVPNRememberOriginal(id view, NSString *slot, UIColor *color) {
-    if (!view || !slot || !color) {
+/// 记一笔：系统原色 + 我们染上去的色。painted 可为 nil（表示只记原色）。
+static void SVPNRecord(id view, NSString *slot, UIColor *systemColor, UIColor *paintedColor) {
+    if (!view || !slot || !systemColor) {
         return;
     }
     @try {
-        SVPNEnsureViewTables();
-        NSDictionary *p = [gSVPNPainted objectForKey:view];
-        UIColor *last = p ? [p objectForKey:slot] : nil;
-        if (last && [last isEqual:color]) {
+        NSMutableDictionary *d = SVPNLedgerDict(view, YES);
+        if (!d) {
             return;
         }
-        NSMutableDictionary *d = SVPNViewSlotDict(gSVPNOriginals, view);
-        if (d) {
-            [d setObject:color forKey:slot];
+        // ① 残留识别
+        NSString *paintedKey = [slot stringByAppendingString:@"#"];
+        UIColor *lastPainted = [d objectForKey:paintedKey];
+        if (lastPainted && [lastPainted isEqual:systemColor]) {
+            return;   // 这个「系统色」其实是我上次染的，不能当原色记
+        }
+        [d setObject:systemColor forKey:slot];
+        if (paintedColor) {
+            [d setObject:paintedColor forKey:paintedKey];
+        }
+        int style = SVPNUserInterfaceStyle(NO);
+        if (style >= 0) {
+            [d setObject:@(style) forKey:SVPN_STYLE_KEY];
         }
     } @catch (NSException *e) {
         // 记账失败最多是这次还原不全，绝不影响宿主
     }
 }
 
-/// 记下「我们染上去的是什么色」，供下一轮识别残留
-static void SVPNRememberPainted(id view, NSString *slot, UIColor *color) {
-    if (!view || !slot || !color) {
+/// 写一个色回视图的某个槽位。任意一条检查不过就不写。
+static void SVPNRestoreSlot(id view, NSString *setter, NSString *getter, UIColor *color) {
+    if (!view || !setter || !color) {
         return;
     }
     @try {
-        SVPNEnsureViewTables();
-        NSMutableDictionary *d = SVPNViewSlotDict(gSVPNPainted, view);
-        if (d) {
-            [d setObject:color forKey:slot];
+        SEL sel = NSSelectorFromString(setter);
+        if (!sel || ![view respondsToSelector:sel]) {
+            return;
+        }
+        CGFloat r = 0, g = 0, b = 0, a = 0;
+        if (![color getRed:&r green:&g blue:&b alpha:&a]) {
+            return;   // 非实色：按当前 trait 重解析可能又变另一个色，不写
+        }
+        if (a <= 0.001) {
+            return;   // 透明色写上去就是看不见
+        }
+        // 幂等：已经相同就不写
+        if (getter) {
+            SEL gsel = NSSelectorFromString(getter);
+            if (gsel && [view respondsToSelector:gsel]) {
+                @try {
+                    IMP gimp = [view methodForSelector:gsel];
+                    if (gimp) {
+                        // __unsafe_unretained：ARC 不知道函数指针返回对象的所有权，
+                        // 默认按 +1 处理会误 release 别人的对象 → 崩宿主。
+                        __unsafe_unretained id cur = ((id (*)(id, SEL))gimp)(view, gsel);
+                        if ([cur isKindOfClass:[UIColor class]] && [cur isEqual:color]) {
+                            return;
+                        }
+                    }
+                } @catch (NSException *e) {
+                }
+            }
+        }
+        IMP imp = [view methodForSelector:sel];
+        if (imp) {
+            ((void (*)(id, SEL, id))imp)(view, sel, color);
         }
     } @catch (NSException *e) {
     }
 }
 
-/// 把记下来的系统色回写。slot → setter 一一对应，不存在的选择子直接跳过。
-static void SVPNRestorePaintedViewsNow(void) {
+static void SVPNRestoreNow(void) {
     if (!gSVPNReady) {
         return;
     }
-    // ④ 延后执行期间可能已经重新连上，此时擦色就是新 bug
-    if (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled) {
+    // 延后执行期间可能已经重新连上，此时擦色就是新 bug
+    if (SVPNDecision()) {
         return;
     }
-    if (!gSVPNOriginals) {
+    if (!gSVPNLedger) {
         return;
     }
 
-    // ③ 先把视图收集到数组，再按数组还原：
-    //    NSMapTable 在 fast enumeration 过程中被访问/修改属于未定义行为。
+    int styleNow = SVPNUserInterfaceStyle(YES);
+
+    // 先收集再处理：遍历 NSMapTable 的同时改它属于未定义行为
     NSMutableArray *views = [NSMutableArray array];
     @try {
-        for (id v in gSVPNOriginals) {
+        for (id v in gSVPNLedger) {
             if (v) {
                 [views addObject:v];
             }
@@ -784,82 +420,79 @@ static void SVPNRestorePaintedViewsNow(void) {
         return;
     }
 
-    // slot → 还原用的 setter（顺序无关，逐条独立判定）
-    // ★ 只登记真正被染过的三个槽位。dim（imageDimmedTintColor）是 styleAttrs
-    //   上的属性、没有对应的视图 setter，登记了也永远还原不了，故不放进来。
+    // 槽位 → setter / getter。只碰这三个：来源明确、有对应视图 setter。
+    // （tint 那一路已删：记账来源是 textColor 但系统原 imageTintColor 未必等于它，
+    //   且 setTintColor: 是 UIView 通用属性会传播到子视图。）
     NSArray *plan = @[
-        @[@"tc", @"setTextColor:"],
-        @[@"ac", @"setActiveColor:"],
-        @[@"ic", @"setInactiveColor:"],
-        @[@"tint", @"setTintColor:"],
+        @[@"tc", @"setTextColor:", @"textColor"],
+        @[@"ac", @"setActiveColor:", @"activeColor"],
+        @[@"ic", @"setInactiveColor:", @"inactiveColor"],
     ];
 
     for (id view in views) {
-        NSDictionary *d = nil;
-        @try {
-            d = [gSVPNOriginals objectForKey:view];
-        } @catch (NSException *e) {
-            continue;
-        }
+        NSMutableDictionary *d = SVPNLedgerDict(view, NO);
         if (!d) {
             continue;
         }
-        for (NSArray *pair in plan) {
-            UIColor *c = nil;
-            @try {
-                c = [d objectForKey:pair[0]];
-            } @catch (NSException *e) {
-                c = nil;
+        // ② 逐视图外观比对：过期就跳过这个视图（不清表）
+        BOOL usable = YES;
+        @try {
+            NSNumber *rec = [d objectForKey:SVPN_STYLE_KEY];
+            if (styleNow >= 0 && rec && [rec intValue] != styleNow) {
+                usable = NO;
             }
-            if (!c) {
-                continue;
-            }
-            SEL sel = NSSelectorFromString(pair[1]);
-            if (!sel || ![view respondsToSelector:sel]) {
-                continue;
-            }
-            // 用 IMP 直调：绕开 performSelector 在 ARC 下的 leak 警告，
-            // 也不引入 objc_msgSend 的裸函数指针转换
-            @try {
-                IMP imp = [view methodForSelector:sel];
-                if (imp) {
-                    ((void (*)(id, SEL, id))imp)(view, sel, c);
+        } @catch (NSException *e) {
+            usable = NO;
+        }
+        if (usable) {
+            for (NSArray *pair in plan) {
+                UIColor *c = nil;
+                @try {
+                    c = [d objectForKey:pair[0]];
+                } @catch (NSException *e) {
+                    c = nil;
                 }
-            } @catch (NSException *e) {
+                if (c) {
+                    SVPNRestoreSlot(view, pair[1], pair[2], c);
+                }
             }
         }
+        // ④ 销账。原色表必销（账本不跨周期）；
+        //    「我染的色」只在真还原时销 —— 外观不符跳过时若把它销掉，
+        //    下一轮残留识别就失效，会把绿色当系统色存下来。
         @try {
-            [view setNeedsDisplay];
+            [gSVPNLedger removeObjectForKey:view];
         } @catch (NSException *e) {
         }
     }
 }
 
-/// 过渡触发：不在「系统正消化本轮数据」的中途改视图，推到主队列下一拍。
-/// 状态栏所有 hook 都在主线程，登记表因此无需加锁。
-static void SVPNRestorePaintedViewsAsync(void) {
+static void SVPNRestoreAsync(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            SVPNRestorePaintedViewsNow();
+            SVPNRestoreNow();
         } @catch (NSException *e) {
-            // 绝不外泄：还原失败最多是颜色晚点退，不能因此崩宿主
+            // 还原失败最多是颜色晚点退，绝不能因此崩宿主
         }
     });
 }
 
-/// 每个数据层 hook 末尾调一次。两个 hook 都会调，第二次进来 prev 已是 0，
+/// 每个数据层 hook 末尾调一次。两个 hook 都调，第二次 prev 已是 0，
 /// 不会重复触发 —— 天然去重，不需要额外的重入标志。
-static void SVPNNoteDecisionTransition(void) {
+static void SVPNNoteTransition(void) {
     if (!gSVPNReady) {
         return;
     }
-    BOOL now = (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
+    BOOL now = SVPNDecision();
     int prev = gSVPNLastDecision;
     gSVPNLastDecision = now ? 1 : 0;
     if (prev == 1 && !now) {
-        SVPNRestorePaintedViewsAsync();
+        SVPNRestoreAsync();
     }
 }
+
+// ============================================================================
+// iOS 17
 // ============================================================================
 
 %group SingleVPN_17
@@ -868,121 +501,133 @@ static void SVPNNoteDecisionTransition(void) {
 
 - (void)_updateWithAggregatedData:(STStatusBarData *)data {
     if (gSVPNReady) {
-
-        // 2.1-9：VPN 状态只认本轮 data 携带的条目，本轮没带就保持上一轮值。
-        // 上游 6e068f7 当初为配合「回填旧 entry」，把上一轮快照与 data 做或运算；
-        // 2.1-8 已关掉回填，这个 OR 失去前提，却把断开时的旧 YES 永久锁存
-        // → 连上能染色、断开不恢复。
-        STStatusBarDataEntry *vpnNow = data.vpnEntry;
-        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }
-        // 2.1-10：状态可能刚从「染」变成「不染」，此时桌面那套常驻视图
-        // 不会被系统重新下发样式，必须自己把颜色擦回去。
-        SVPNNoteDecisionTransition();
-
-    #if SVPN_DIAG
-        STStatusBarData *currentData = [self currentData];
-        // ★ 只在数据可疑时记录：这个方法是每帧走的，绝不能无条件拼字符串。
-        //   可疑 = cellularEntry / wifiEntry 出现 nil 或 enabled=NO。
-        //   同一份 data（同一地址）只记一次，避免重复拼串拖慢 SpringBoard。
-        gDiagSeq = 0;
-        // 心跳：独立于 gDiagCount 上限，保证「数据一直正常」时也能证明 hook 在跑
-        gAggCallCount++;
-        if (SVPNHeartbeatDue(gAggCallCount)) {
-            BOOL hn = NO, hd = NO;
-            SVPNDataLooksSuspicious(data, &hn, &hd);
-            SVPNLog(@"[SVPN] HB agg n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
-                  (unsigned long)gAggCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
-                  SVPNEntryDesc(@"cell", currentData.cellularEntry),
-                  SVPNEntryDesc(@"wifi", currentData.wifiEntry));
-        }
-        if (gDiagCount < gDiagMax) {
-            const void *addr = (__bridge const void *)data;
-            // 只有「和上一条完全同一份对象」才跳过，避免每帧重复拼串。
-            // 注意不能只在可疑时才更新 gLastLoggedData —— 那样同一地址
-            // 在「先正常、后可疑」两次回调里会被判成新数据而重复记录，
-            // 且在地址被复用时可能漏记。这里无条件记账，只做相邻去重。
-            if (addr != gLastLoggedData) {
-                gLastLoggedData = addr;
-                BOOL anyNil = NO, anyDis = NO;
-                BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-                if (bad) {
-                    gDiagCount++;
-                    gDiagSeq = gDiagCount;
-                    SVPNLog(@"[SVPN] #%lu AGG SUSPECT nil=%d disabled=%d vpnOn=%d",
-                          (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-                    SVPNLogData(@"AGG  in ", data);
-                    SVPNLogData(@"AGG  cur", currentData);
-                }
+        @try {
+            // 只认本轮 data 携带的条目：本轮没带就保持上一轮值。
+            // 绝不与上一轮快照做或运算 —— 那会把断开时的 YES 永久锁存。
+            STStatusBarDataEntry *vpnNow = data.vpnEntry;
+            if (vpnNow) {
+                _isVPNEnabled = vpnNow.enabled;
             }
+            SVPNNoteTransition();
+        } @catch (NSException *e) {
         }
-    #endif
-
-        if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
-            data = svpnMergeMissingEntries(self, data);
-        }
-
-    #if SVPN_DIAG
-        if (gDiagSeq) {
-            SVPNLogData(@"AGG  out", data);
-        }
-    #endif
     }
     %orig;
 }
 
-- (void)_updateWithData:(STStatusBarData *)data completionHandler:(id)a4 {
+- (void)_updateWithData:(STStatusBarData *)data completionHandler:(id)handler {
     if (gSVPNReady) {
-
-        // 2.1-9：VPN 状态只认本轮 data 携带的条目，本轮没带就保持上一轮值。
-        // 上游 6e068f7 当初为配合「回填旧 entry」，把上一轮快照与 data 做或运算；
-        // 2.1-8 已关掉回填，这个 OR 失去前提，却把断开时的旧 YES 永久锁存
-        // → 连上能染色、断开不恢复。
-        STStatusBarDataEntry *vpnNow = data.vpnEntry;
-        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }
-        // 2.1-10：状态可能刚从「染」变成「不染」，此时桌面那套常驻视图
-        // 不会被系统重新下发样式，必须自己把颜色擦回去。
-        SVPNNoteDecisionTransition();
-
-    #if SVPN_DIAG
-        STStatusBarData *currentData = [self currentData];
-        gDiagSeq = 0;
-        gUpdCallCount++;
-        if (SVPNHeartbeatDue(gUpdCallCount)) {
-            BOOL hn = NO, hd = NO;
-            SVPNDataLooksSuspicious(data, &hn, &hd);
-            SVPNLog(@"[SVPN] HB upd n=%lu nil=%d dis=%d vpnOn=%d cur=%@ %@",
-                  (unsigned long)gUpdCallCount, (int)hn, (int)hd, (int)_isVPNEnabled,
-                  SVPNEntryDesc(@"cell", currentData.cellularEntry),
-                  SVPNEntryDesc(@"wifi", currentData.wifiEntry));
-        }
-        if (gDiagCount < gDiagMax) {
-            const void *addr = (__bridge const void *)data;
-            // 用独立变量做去重：两个 hook 共用一份会互相覆盖，导致该记的被跳过
-            if (addr != gLastLoggedData2) {
-                gLastLoggedData2 = addr;
-                BOOL anyNil = NO, anyDis = NO;
-                BOOL bad = SVPNDataLooksSuspicious(data, &anyNil, &anyDis);
-                if (bad) {
-                    gDiagCount++;
-                    gDiagSeq = gDiagCount;
-                    SVPNLog(@"[SVPN] #%lu UPD SUSPECT nil=%d disabled=%d vpnOn=%d",
-                          (unsigned long)gDiagSeq, (int)anyNil, (int)anyDis, (int)_isVPNEnabled);
-                    SVPNLogData(@"UPD  in ", data);
-                    SVPNLogData(@"UPD  cur", currentData);
-                }
+        @try {
+            STStatusBarDataEntry *vpnNow = data.vpnEntry;
+            if (vpnNow) {
+                _isVPNEnabled = vpnNow.enabled;
             }
+            SVPNNoteTransition();
+        } @catch (NSException *e) {
         }
-    #endif
+    }
+    %orig;
+}
 
-        if (!SVPN_DISABLE_ENTRY_MERGE && _isVPNEnabled) {
-            data = svpnMergeMissingEntries(self, data);
-        }
+%end
 
-    #if SVPN_DIAG
-        if (gDiagSeq) {
-            SVPNLogData(@"UPD  out", data);
+%hook STUIStatusBarStringView
+
+- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
+    if (SVPNDecision() && IsNetworkTypeText(self.text)) {
+        @try {
+            // ★ 必须在 copy 之前读：改的是副本，原始入参才是系统本来要用的色
+            UIColor *sysTextColor = styleAttrs.textColor;
+            UIColor *paint = svpnReplacementFor(sysTextColor);
+            if (paint) {
+                STUIStatusBarStyleAttributes *copy = [styleAttrs copy];
+                [copy setTextColor:paint];
+                styleAttrs = copy;
+                SVPNRecord(self, @"tc", sysTextColor, paint);
+            }
+        } @catch (NSException *e) {
         }
-    #endif
+    }
+    %orig;
+    [self svpnApply5GAdvancedAttributesIfNeeded];
+}
+
+- (void)setText:(NSString *)text {
+    %orig;
+
+    if (SVPNDecision() && IsNetworkTypeText(text)) {
+        @try {
+            // self.textColor 可能是我们上一轮染的（SVPNRecord 会识别并拒绝记账）
+            UIColor *cur = self.textColor;
+            UIColor *paint = svpnReplacementFor(cur);
+            if (paint) {
+                [self setTextColor:paint];
+                SVPNRecord(self, @"tc", cur, paint);
+            }
+        } @catch (NSException *e) {
+        }
+    }
+    [self svpnApply5GAdvancedAttributesIfNeeded];
+}
+
+%end
+
+%hook STUIStatusBarWifiSignalView
+
+- (void)setActiveColor:(UIColor *)activeColor {
+    if (SVPNDecision() && activeColor) {
+        @try {
+            // 入参就是系统本来要用的色 → 必须改之前记账
+            UIColor *paint = svpnReplacementFor(activeColor);
+            if (paint) {
+                SVPNRecord(self, @"ac", activeColor, paint);
+                activeColor = paint;
+            }
+        } @catch (NSException *e) {
+        }
+    }
+    %orig;
+}
+
+- (void)setInactiveColor:(UIColor *)inactiveColor {
+    if (SVPNDecision() && inactiveColor) {
+        @try {
+            // ★★ 保 alpha：原来写 colorWithAlphaComponent:0.2，把系统接近 1 的
+            //    alpha 直接压到 0.2 → 深底全黑 / 浅底全白 → 图标「彻底空着」。
+            UIColor *paint = svpnReplaceKeepingAlpha(inactiveColor, svpnReplacementFor(inactiveColor));
+            if (paint) {
+                SVPNRecord(self, @"ic", inactiveColor, paint);
+                inactiveColor = paint;
+            }
+        } @catch (NSException *e) {
+        }
+    }
+    %orig;
+}
+
+- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
+    if (SVPNDecision() && styleAttrs) {
+        @try {
+            UIColor *sysTint = styleAttrs.imageTintColor ?: styleAttrs.textColor;
+            UIColor *sysDimmed = styleAttrs.imageDimmedTintColor;
+            UIColor *hue = svpnReplacementFor(styleAttrs.textColor ?: sysTint);
+            if (hue) {
+                STUIStatusBarStyleAttributes *copy = [styleAttrs copy];
+                [copy setImageTintColor:hue];
+                // ★★ dimmed 也要保 alpha：原来压到 0.2 同样会把次要元素弄没。
+                UIColor *dimmed = svpnReplaceKeepingAlpha(sysDimmed ?: sysTint, hue);
+                if (dimmed) {
+                    [copy setImageDimmedTintColor:dimmed];
+                }
+                styleAttrs = copy;
+                // 这一路不记账：styleAttrs 是临时对象，改它只影响本次绘制。
+                // 要还原得落到具体视图上，而视图侧没有与 imageTintColor 对应的
+                // 安全 setter（setTintColor: 会传播到子视图）。
+                // 这一路的色本来就会在下一次样式下发时被自然覆盖。
+                (void)sysTint;
+            }
+        } @catch (NSException *e) {
+        }
     }
     %orig;
 }
@@ -992,7 +637,7 @@ static void SVPNNoteDecisionTransition(void) {
 %hook STUIStatusBarCellularNetworkTypeView
 
 - (void)setText:(NSString *)text prefixLength:(NSInteger)prefixLength withStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs forType:(NSInteger)type animated:(BOOL)animated {
-    if (!gSVPNReady || ![text hasPrefix:@"5G"] || !_isForce5GAEnabled) {
+    if (!gSVPNReady || !_isForce5GAEnabled || ![text hasPrefix:@"5G"]) {
         %orig;
         if (@available(iOS 16, *)) {
             if (gSVPNReady && _isForce5GAEnabled && !self.widthConstraint.active) {
@@ -1026,280 +671,205 @@ static void SVPNNoteDecisionTransition(void) {
 
 %new
 - (void)svpnApply5GAdvancedAttributesIfNeeded {
+    if (!gSVPNReady || !_isForce5GAEnabled) {
+        return;
+    }
     if (@available(iOS 16, *)) {
-        if (!gSVPNReady || !_isForce5GAEnabled) {
-            return;
+        @try {
+            NSString *text = self.text;
+            if (!IsNetworkTypeText(text)) {
+                return;
+            }
+            UIFont *font = self.font;
+            if (!font) {
+                return;
+            }
+            UIColor *textColor = self.textColor;
+            if (!textColor) {
+                return;
+            }
+
+            NSString *newText = @"5GA";
+            NSInteger prefixLength = 2;
+            NSMutableAttributedString *attributedText =
+                [[NSMutableAttributedString alloc] initWithString:newText attributes:@{
+                    NSFontAttributeName: font,
+                    NSForegroundColorAttributeName: textColor,
+                }];
+
+            NSMutableDictionary *traits = [[font.fontDescriptor objectForKey:UIFontDescriptorTraitsAttribute] mutableCopy]
+                ?: [NSMutableDictionary dictionary];
+            traits[UIFontWidthTrait] = @(UIFontWidthCondensed / 1.5);
+            traits[UIFontWeightTrait] = @(UIFontWeightSemibold);
+
+            UIFontDescriptor *condensedDescriptor =
+                [font.fontDescriptor fontDescriptorByAddingAttributes:@{UIFontDescriptorTraitsAttribute: traits}];
+            UIFont *condensedFont = [UIFont fontWithDescriptor:condensedDescriptor size:0];
+            UIFont *smallerCondensedFont = [condensedFont fontWithSize:condensedFont.pointSize * 0.7];
+
+            [attributedText addAttribute:NSFontAttributeName value:condensedFont range:NSMakeRange(0, prefixLength)];
+            [attributedText addAttribute:NSFontAttributeName value:smallerCondensedFont
+                                   range:NSMakeRange(prefixLength, attributedText.length - prefixLength)];
+
+            self.attributedText = attributedText;
+        } @catch (NSException *e) {
         }
-
-        NSString *text = self.text;
-        if (![text hasPrefix:@"5G"]) {
-            return;
-        }
-
-        UIFont *font = self.font;
-        if (!font) {
-            return;
-        }
-
-        UIColor *textColor = self.textColor;
-        if (!textColor) {
-            return;
-        }
-
-        NSString *newText = @"5GA";
-        NSInteger prefixLength = 2;
-        NSMutableAttributedString *attributedText = [[NSMutableAttributedString alloc] initWithString:newText attributes:@{
-            NSFontAttributeName: font,
-            NSForegroundColorAttributeName: textColor,
-        }];
-
-        NSMutableDictionary *traits = [[font.fontDescriptor objectForKey:UIFontDescriptorTraitsAttribute] mutableCopy] ?: [NSMutableDictionary dictionary];
-        traits[UIFontWidthTrait] = @(UIFontWidthCondensed / 1.5);
-        traits[UIFontWeightTrait] = @(UIFontWeightSemibold);
-
-        UIFontDescriptor *condensedDescriptor = [font.fontDescriptor fontDescriptorByAddingAttributes:@{UIFontDescriptorTraitsAttribute: traits}];
-        UIFont *condensedFont = [UIFont fontWithDescriptor:condensedDescriptor size:0];
-        UIFont *smallerCondensedFont = [condensedFont fontWithSize:condensedFont.pointSize * 0.7];
-
-        [attributedText addAttribute:NSFontAttributeName value:condensedFont range:NSMakeRange(0, prefixLength)];
-        [attributedText addAttribute:NSFontAttributeName value:smallerCondensedFont range:NSMakeRange(prefixLength, attributedText.length - prefixLength)];
-
-        self.attributedText = attributedText;
     }
-}
-
-- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
-    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
-    if (decision && IsNetworkTypeText(self.text)) {
-        // ★ 必须在 copy 之前读：改的是副本，self 拿到的原始 styleAttrs 没动，
-        //   它才是系统本来要用的色。
-        UIColor *sysTextColor = styleAttrs.textColor;
-        styleAttrs = [styleAttrs copy];
-        UIColor *paint = svpnColorWithTextColor(sysTextColor);
-        [styleAttrs setTextColor:paint];
-        // 2.1-10：记下系统色与我们染的色，断开时据此还原
-        SVPNRememberOriginal(self, @"tc", sysTextColor);
-        SVPNRememberPainted(self, @"tc", paint);
-    }
-
-    %orig;
-    [self svpnApply5GAdvancedAttributesIfNeeded];
-}
-
-- (void)setText:(NSString *)text {
-    %orig;
-
-    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
-    if (decision && IsNetworkTypeText(text)) {
-        // ★ 这里读的 self.textColor 不一定是系统色：setText: 之后 self.textColor
-        //   可能还留着上一轮染上的绿。SVPNRememberOriginal 内部会拿它和
-        //   「上次染的色」比对，相同就拒绝记账，避免把绿色当系统色存下来。
-        UIColor *cur = self.textColor;
-        UIColor *paint = svpnColorWithTextColor(cur);
-        [self setTextColor:paint];
-        SVPNRememberOriginal(self, @"tc", cur);
-        SVPNRememberPainted(self, @"tc", paint);
-    }
-
-    [self svpnApply5GAdvancedAttributesIfNeeded];
-}
-
-%end
-
-%hook STUIStatusBarWifiSignalView
-
-- (void)setActiveColor:(UIColor *)activeColor {
-    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
-
-#if SVPN_DIAG
-    // 只在「颜色为空」或「前 40 次染色」时记录 —— 后者用来抓
-    // respring 后第一批渲染的输入/输出颜色（暗色误判就发生在这里）。
-    // 正常染色不该额外产生任何日志，也不重复计算颜色。
-    if ((!activeColor || gColorDiagCount < 40) && gDiagCount < gDiagMax) {
-        gDiagCount++;
-        gColorDiagCount++;
-        SVPNLog(@"[SVPN] #%lu WIFI setActiveColor in=%@ tint=%d out=%@ self=%@",
-              (unsigned long)gDiagCount, SVPNColorDesc(activeColor), (int)decision,
-              SVPNColorDesc(decision ? svpnColorWithTextColor(activeColor) : activeColor),
-              NSStringFromClass([self class]));
-    }
-#endif
-
-    if (decision) {
-        // 入参就是系统本来要用的色 → 记账必须在改入参之前
-        SVPNRememberOriginal(self, @"ac", activeColor);
-        UIColor *paint = svpnColorWithTextColor(activeColor);
-        SVPNRememberPainted(self, @"ac", paint);
-        activeColor = paint;
-    }
-
-    %orig;
-}
-
-- (void)setInactiveColor:(UIColor *)inactiveColor {
-    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
-    if (decision) {
-        SVPNRememberOriginal(self, @"ic", inactiveColor);
-        UIColor *paint = [svpnColorWithTextColor(inactiveColor) colorWithAlphaComponent:0.2];
-        SVPNRememberPainted(self, @"ic", paint);
-        inactiveColor = paint;
-    }
-
-    %orig;
-}
-
-- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
-    BOOL decision = gSVPNReady && (_isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled);
-
-#if SVPN_DIAG
-    // 这是蜂窝图标真正吃染色的入口（改的是 styleAttrs 的 imageTintColor，
-    // 不是 view 的 activeColor）。前 40 次 + 输入为空时记录。
-    if ((!styleAttrs || gStyleDiagCount < 40) && gDiagCount < gDiagMax) {
-        gDiagCount++;
-        gStyleDiagCount++;
-        UIColor *inColor = nil;
-        @try { inColor = styleAttrs.textColor; } @catch (NSException *e) {}
-        SVPNLog(@"[SVPN] #%lu STYLE in=%@ tint=%d out=%@ self=%@",
-              (unsigned long)gDiagCount, SVPNColorDesc(inColor), (int)decision,
-              SVPNColorDesc(decision ? svpnColorWithTextColor(inColor) : inColor),
-              NSStringFromClass([self class]));
-    }
-#endif
-
-    if (decision) {
-        styleAttrs = [styleAttrs copy];
-        // 同上：copy 之后 textColor 取自副本，但副本的 textColor 就是系统原值
-        UIColor *sysColor = styleAttrs.textColor;
-        UIColor *newColor = svpnColorWithTextColor(sysColor);
-        [styleAttrs setImageTintColor:newColor];
-        [styleAttrs setImageDimmedTintColor:[newColor colorWithAlphaComponent:0.2]];
-        // 2.1-10：蜂窝图标走的是 styleAttrs 的 tint，还原时按「视图 + slot」回写。
-        //   styleAttrs 是临时对象，还原需要落到具体视图上，所以 key 用 self。
-        SVPNRememberOriginal(self, @"tint", sysColor);
-        SVPNRememberPainted(self, @"tint", newColor);
-    }
-
-    %orig;
 }
 
 %end
 
 %end // SingleVPN_17
 
+// ============================================================================
+// iOS 16（保持上游基线，不做任何改动）
+//
+// 为什么不动：用户设备是 iOS 17，这段代码永远不会被执行，改了也无法验证。
+// 「无法验证的改动」本身就是风险 —— 宁可让它保持上游原样（含它自己的
+// alpha 0.2 问题），也不在这一版塞进一段没人跑过的代码。
+// 若将来要支持 iOS 16，应当按 iOS 17 的结构重写这一组，而不是在这里增量改。
+// ============================================================================
+
+%group SingleVPN_16
+
+%hook _UIStatusBarWifiItem
+
+- (id)applyUpdate:(_UIStatusBarItemUpdate *)update toDisplayItem:(_UIStatusBarDisplayItem *)displayItem {
+    _isVPNEnabled = update.data.vpnEntry.enabled;
+
+    id result = %orig;
+
+    UIColor *originalColor = update.styleAttributes.textColor;
+    UIColor *newColor = nil;
+
+    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    if (decision) {
+        newColor = svpnReplacementFor(originalColor);
+    }
+
+    if (!newColor) { newColor = update.styleAttributes.imageTintColor ?: originalColor; }
+
+    for (_UIStatusBarDisplayItem *item in self.displayItems.allValues) {
+        %orig(update, item);
+
+        if (item.view == self.networkIconView && [item.view isKindOfClass:%c(_UIStatusBarImageView)]) {
+            _UIStatusBarImageView *imageView = (_UIStatusBarImageView *)item.view;
+            [imageView setTintColor:newColor];
+        }
+    }
+
+    return result;
+}
+
+- (UIColor *)_fillColorForUpdate:(_UIStatusBarItemUpdate *)update entry:(_UIStatusBarDataWifiEntry *)entry {
+    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    if (decision) {
+        return svpnReplacementFor(update.styleAttributes.textColor);
+    } else {
+        return %orig;
+    }
+}
+
+%end
+
+%hook _UIStatusBarCellularItem
+
+- (id)applyUpdate:(_UIStatusBarItemUpdate *)update toDisplayItem:(_UIStatusBarDisplayItem *)displayItem {
+    _isVPNEnabled = update.data.vpnEntry.enabled;
+
+    id result = %orig;
+
+    UIColor *originalColor = update.styleAttributes.textColor;
+    UIColor *newColor = nil;
+
+    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    if (decision) {
+        newColor = svpnReplacementFor(originalColor);
+    }
+
+    if (!newColor) { newColor = originalColor; }
+
+    for (_UIStatusBarDisplayItem *item in self.displayItems.allValues) {
+        _UIStatusBarStringView *stringView = nil;
+
+        if ([item.view isKindOfClass:%c(_UIStatusBarCellularNetworkTypeView)]) {
+            stringView = ((_UIStatusBarCellularNetworkTypeView *)item.view).stringView;
+        } else if ([item.view isKindOfClass:%c(_UIStatusBarStringView)]) {
+            stringView = (_UIStatusBarStringView *)item.view;
+        }
+
+        if (IsNetworkTypeText(stringView.text)) {
+            [stringView setTextColor:newColor];
+        } else {
+            [stringView setTextColor:originalColor];
+        }
+    }
+
+    return result;
+}
+
+%end
+
+%hook _UIStatusBarStringView
+
+- (void)applyStyleAttributes:(_UIStatusBarStyleAttributes *)styleAttrs {
+    %orig;
+
+    BOOL decision = _isEnabledReversed ? !_isVPNEnabled : _isVPNEnabled;
+    if (decision && IsNetworkTypeText(self.text)) {
+        UIColor *paint = svpnReplacementFor(styleAttrs.textColor);
+        if (paint) {
+            [self setTextColor:paint];
+        }
+    }
+}
+
+%end
+
+%end // SingleVPN_16
+
+// ============================================================================
+// 入口
+// ============================================================================
+
 %ctor {
     ReloadPrefs();
 
-#if SVPN_DIAG
-    // ★ 必须在 IsEnabled 判断之前打：否则「插件被关掉」时一条日志都没有，
-    //   会被误判成「诊断版没装上」，白跑一轮。
-    SVPNLog(@"[SVPN] ==== ctor enter ==== (SVPN_DIAG=1 version=2.1-9)");
-    SVPNLog(@"[SVPN] prefs raw IsEnabled=%d", (int)_isEnabled);
-    // 告诉用户日志落在哪：抓不到系统日志时可直接用 Filza 打开这个文件
-    NSString *svpn_lp = SVPNLogFilePath();
-    SVPNLog(@"[SVPN] logfile=%@", svpn_lp ? svpn_lp : @"(写入失败，只能看系统日志)");
-#endif
-
     if (!_isEnabled) {
-#if SVPN_DIAG
-        SVPNLog(@"[SVPN] ==== ctor exit: plugin disabled in prefs, no hooks ====");
-#endif
         return;
     }
 
-#if SVPN_DIAG
-    // 启动快照：先确认「我们以为 hook 到的类」真的存在。
-    // 若某个类是 Nil，那套 hook 就是空转 —— 所有基于它的推理全部失效。
-    SVPNLog(@"[SVPN] ==== ctor begin ====");
-    SVPNLog(@"[SVPN] prefs IsEnabled=%d Rev=%d Force5GA=%d light=%@ dark=%@",
-          (int)_isEnabled, (int)_isEnabledReversed, (int)_isForce5GAEnabled,
-          SVPNColorDesc(_lightReplacementColor), SVPNColorDesc(_darkReplacementColor));
-
-    // 外观 + 系统色基准：svpn_isDarkColor 对「非 RGB 色」一律返回 NO（当亮色处理），
-    // 所以在浅色模式下遇到动态色会选错色。这里把判定结果直接打出来。
+    // 设置页改动后热生效。用 CFNotificationCenter 而不是 NSNotification：
+    // 跨进程通知只有 Darwin 通知中心能收到。
     @try {
-        UITraitCollection *tr = nil;
-        @try {
-            UIApplication *app = [UIApplication sharedApplication];
-            if (app) {
-                tr = [(id)app traitCollection];
-            }
-        } @catch (NSException *e) {}
-        if (!tr) {
-            // %ctor 阶段 sharedApplication 可能还没建好，用当前 trait 兜底
-            @try { tr = [UITraitCollection currentTraitCollection]; } @catch (NSException *e) {}
-        }
-        NSString *style = @"?";
-        if (tr) {
-            style = (tr.userInterfaceStyle == UIUserInterfaceStyleDark) ? @"dark"
-                   : (tr.userInterfaceStyle == UIUserInterfaceStyleLight ? @"light" : @"unspecified");
-        }
-        UIColor *labelC = nil;
-        @try { labelC = [UIColor labelColor]; } @catch (NSException *e) {}
-        BOOL dark = NO;
-        @try { dark = [labelC svpn_isDarkColor]; } @catch (NSException *e) {}
-        SVPNLog(@"[SVPN] appearance=%@ labelColor=%@ isDark=%d => pick=%@",
-              style, SVPNColorDesc(labelC), (int)dark,
-              SVPNColorDesc(svpnColorWithTextColor(labelC)));
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            NULL,
+            (CFNotificationCallback)ReloadPrefs,
+            CFSTR("com.82flex.singlevpnprefs/saved"),
+            NULL,
+            CFNotificationSuspensionBehaviorCoalesce
+        );
     } @catch (NSException *e) {
-        SVPNLog(@"[SVPN] appearance probe failed: %@", e.reason);
-    }
-    NSArray *cls = @[@"STUIStatusBar", @"STUIStatusBarCellularNetworkTypeView",
-                     @"STUIStatusBarStringView", @"STUIStatusBarWifiSignalView",
-                     @"STUIStatusBarCellularSignalView",
-                     @"STUIStatusBarDualCellularSignalView"];
-    for (NSString *n in cls) {
-        Class c = NSClassFromString(n);
-        SVPNLog(@"[SVPN] class %@ = %@", n, c ? @"FOUND" : @"NIL");
     }
 
-    // ★ 私有 API 存在性探测：这几处在染色路径上被直接调用，
-    //   如果类不支持某选择子，运行时就是 unrecognized selector（可能崩 SpringBoard）。
-    //   本段只做查询，不调用，无副作用。
-    @try {
-        Class sc = NSClassFromString(@"STUIStatusBarStyleAttributes");
-        if (sc) {
-            NSArray *sels = @[@"copy", @"copyWithZone:",
-                              @"setImageTintColor:", @"setImageDimmedTintColor:",
-                              @"textColor", @"setTextColor:"];
-            NSMutableArray *have = [NSMutableArray array];
-            NSMutableArray *miss = [NSMutableArray array];
-            for (NSString *s in sels) {
-                BOOL inst = [sc instancesRespondToSelector:NSSelectorFromString(s)];
-                [(inst ? have : miss) addObject:s];
-            }
-            SVPNLog(@"[SVPN] StyleAttributes SUPPORTED=%@ MISSING=%@", have, miss);
-        } else {
-            SVPNLog(@"[SVPN] StyleAttributes = NIL");
+    // ★ 启动窗口：见文件头 ①。
+    //   窗口内 gSVPNReady=0，所有 hook 纯 %orig 透传，等价于插件不存在。
+    //   这里用 dispatch_after 到主队列 —— 不用后台队列：闸门只写一个 int，
+    //   放后台反而会引入「后台线程改全局状态」的审查疑问。
+    //   注意 DIV 不能写成浮点：NSEC_PER_MSEC 整数乘除即可。
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SVPN_READY_DELAY_MS * NSEC_PER_MSEC)),
+        dispatch_get_main_queue(), ^{
+            gSVPNReady = 1;
         }
-    } @catch (NSException *e) {
-        SVPNLog(@"[SVPN] selector probe failed: %@", e.reason);
-    }
-    SVPNLog(@"[SVPN] ==== ctor end ====");
-#endif
-
-    CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(), 
-        NULL, 
-        (CFNotificationCallback)ReloadPrefs, 
-        CFSTR("com.82flex.singlevpnprefs/saved"), 
-        NULL, 
-        CFNotificationSuspensionBehaviorCoalesce
     );
 
     if (@available(iOS 17, *)) {
+        // StatusStatusUI 是 iOS 17 状态栏的新私有框架，STUIStatusBar* 在这里。
         dlopen("/System/Library/PrivateFrameworks/StatusStatusUI.framework/StatusStatusUI", RTLD_LAZY);
         %init(SingleVPN_17);
     } else {
         %init(SingleVPN_16);
     }
-
-    // 2.1-8：启动窗口结束后才允许插件介入状态栏。
-    // 放在 %init 之后：hook 先装好，窗口内走纯透传分支；
-    // 窗口一过，下一次状态栏更新自然带上染色，无需主动触发重绘（不碰私有刷新 API）。
-    // gSVPNReady 只是个 int，读写都在主线程（状态栏更新与 hook 同线程），无需加锁。
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(SVPN_READY_DELAY_SEC * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
-            gSVPNReady = 1;
-        });
 }

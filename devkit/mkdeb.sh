@@ -68,7 +68,7 @@ cat > "$STAGE/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
 printf '\n'
-printf 'SingleVPN 2.1-10 已安装。\n'
+printf 'SingleVPN 2.2-1 已安装。\n'
 printf '生效方式：装完后手动重启一次桌面即可。\n'
 printf '\n'
 exit 0

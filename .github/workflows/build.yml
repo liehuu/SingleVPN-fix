@@ -9,7 +9,7 @@ on:
       - release
 
 env:
-  VERSION: 2.1-10
+  VERSION: 2.2-1
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
@@ -28,30 +28,84 @@ jobs:
       - name: Verify patch presence
         run: |
           set -e
-          echo "--- 关键改动是否在源码里 ---"
-          grep -q 'SVPN_DISABLE_ENTRY_MERGE 1' SingleVPN.x \
-            || { echo "✗ 回填未关闭"; exit 1; }
-          # 2.1-8：交付版必须关诊断（热路径同步写文件会干扰状态栏首帧）
-          grep -q '^#define SVPN_DIAG 0' SingleVPN.x \
-            || { echo "✗ 诊断未关闭"; exit 1; }
-          # 2.1-8：启动窗口透传闸门必须在（respring 首帧插件完全不介入）
-          grep -q 'static volatile int gSVPNReady = 0;' SingleVPN.x \
+          SRC=SingleVPN.x
+          # 只看非注释行：本项目全部是 // 注释，注释里提到坏词不算违规
+          CODE=$(grep -v '^[[:space:]]*//' "$SRC")
+
+          cnt() { printf '%s' "$1" | grep -Fc -- "$2" || true; }
+
+          echo "--- 0. 确认推上来的是 2.2-1 重写版，不是 2.1-x 旧文件 ---"
+          for old in gSVPNOriginals SVPNRememberOriginal SVPNRestorePaintedViewsNow \
+                     gSVPNPainted kSVPNStyleKey SVPN_DIAG SVPN_DISABLE_ENTRY_MERGE; do
+            if printf '%s' "$CODE" | grep -q -- "$old"; then
+              echo "✗ 源码里还有旧结构 $old —— 推的不是 2.2-1 重写版"; exit 1
+            fi
+          done
+          echo "  ✓ 旧结构已清空"
+
+          echo "--- 1. 启动窗口闸门（2.1-8，实测通过，必须保留）---"
+          test "$(cnt "$CODE" 'static volatile int gSVPNReady = 0;')" -eq 1 \
             || { echo "✗ 启动闸门缺失"; exit 1; }
-          grep -q 'SVPN_READY_DELAY_SEC' SingleVPN.x \
+          test "$(cnt "$CODE" 'gSVPNReady = 1;')" -eq 1 \
+            || { echo "✗ 闸门置 1 的次数不是 1（提前放行）"; exit 1; }
+          grep -q '^#define SVPN_READY_DELAY_MS [0-9]' "$SRC" \
             || { echo "✗ 启动窗口时长缺失"; exit 1; }
-          # 2.1-9：VPN 状态只认本轮 data，禁止与上一轮快照做或运算
-          # （OR 会把断开时的旧 YES 永久锁存 → 连上染色、断开不恢复）
-          test "$(grep -Fc '        if (vpnNow) { _isVPNEnabled = vpnNow.enabled; }' SingleVPN.x)" -eq 2 \
-            || { echo "✗ VPN 状态判定未修（应恰好两处）"; exit 1; }
-          # 2.1-10：断开 VPN 后必须能自己把染色擦回（桌面那套状态栏视图
-          # 不会因断开而被系统重新下发样式，光靠 decision==NO 透传是不够的）
-          grep -q 'SVPNRestorePaintedViewsNow' SingleVPN.x \
-            || { echo "✗ 断开还原路径缺失"; exit 1; }
-          test "$(grep -Fc '        SVPNNoteDecisionTransition();' SingleVPN.x)" -eq 2 \
+
+          echo "--- 2. 判定统一入口 ---"
+          test "$(cnt "$CODE" 'SVPNDecision()')" -ge 6 \
+            || { echo "✗ 判定入口没统一走 SVPNDecision"; exit 1; }
+
+          echo "--- 3. VPN 状态只认本轮 data（2.1-9）---"
+          test "$(cnt "$CODE" 'STStatusBarDataEntry *vpnNow = data.vpnEntry;')" -eq 2 \
+            || { echo "✗ 状态判定未修（应恰好两处）"; exit 1; }
+          test "$(cnt "$CODE" 'currentData.vpnEntry.enabled ||')" -eq 0 \
+            || { echo "✗ 又退回与上一轮快照做或运算（断开不褪色）"; exit 1; }
+          test "$(cnt "$CODE" 'SVPNNoteTransition();')" -eq 2 \
             || { echo "✗ 过渡检测未挂满两个数据层 hook"; exit 1; }
-          test "$(grep -Fc 'SVPNRememberOriginal(self,' SingleVPN.x)" -eq 5 \
-            || { echo "✗ 染色点没记系统原色（应恰好五处）"; exit 1; }
-          echo "✓ 补丁在位"
+
+          echo "--- 4. entry 回填已彻底删除 ---"
+          test "$(cnt "$SRC" 'dataByReplacingEntry')" -eq 0 \
+            || { echo "✗ 还在改写系统 data（塞残缺 entry → 图标整块空白）"; exit 1; }
+
+          echo "--- 5. ★ 2.2-1 核心修复：换色相但保住系统 alpha ---"
+          # colorWithAlphaComponent: 是**替换** alpha 不是叠加。
+          # 系统给未激活格的 alpha 接近 1，被压到 0.2 后深底≈全黑、浅底≈全白，
+          # 两种背景下都「彻底空着」—— 这就是用户报的「不定期图标空白」。
+          test "$(cnt "$CODE" 'colorWithAlphaComponent:')" -eq 0 \
+            || { echo "✗ 又用 colorWithAlphaComponent: 压 alpha（图标会看不见）"; exit 1; }
+          grep -q 'static UIColor \*svpnReplaceKeepingAlpha(UIColor \*original, UIColor \*hue)' "$SRC" \
+            || { echo "✗ 保 alpha 的换色函数缺失"; exit 1; }
+          test "$(cnt "$CODE" 'svpnReplaceKeepingAlpha(inactiveColor,')" -eq 1 \
+            || { echo "✗ setInactiveColor 没走保 alpha 路径"; exit 1; }
+          test "$(cnt "$CODE" 'svpnReplaceKeepingAlpha(sysDimmed ?: sysTint, hue)')" -eq 1 \
+            || { echo "✗ imageDimmedTintColor 没走保 alpha 路径"; exit 1; }
+
+          echo "--- 6. 还原账本（2.1-10 + 重写简化）---"
+          test "$(cnt "$CODE" 'static NSMapTable *gSVPNLedger = nil;')" -eq 1 \
+            || { echo "✗ 还原账本缺失"; exit 1; }
+          test "$(cnt "$CODE" '[gSVPNLedger removeObjectForKey:view];')" -eq 1 \
+            || { echo "✗ 还原后没销账（账本会跨周期复用）"; exit 1; }
+          test "$(cnt "$SRC" '@"tint"')" -eq 0 \
+            || { echo "✗ tint 槽位没清（setTintColor: 会传播到子视图）"; exit 1; }
+          test "$(cnt "$CODE" 'if (prev == 1 && !now) {')" -eq 1 \
+            || { echo "✗ 还原触发条件不是 1→0"; exit 1; }
+
+          echo "--- 7. 写入口三条硬约束 ---"
+          grep -q 'getRed:&r green:&g blue:&b alpha:&a' "$SRC" \
+            || { echo "✗ 缺实色检查（动态色会重解析成错色）"; exit 1; }
+          grep -q 'if (a <= 0.001)' "$SRC" \
+            || { echo "✗ 缺透明色检查（写透明 = 图标空白）"; exit 1; }
+          grep -q '\[cur isEqual:color\]' "$SRC" \
+            || { echo "✗ 缺幂等检查"; exit 1; }
+
+          echo "--- 8. 装包红线 ---"
+          if grep -Eq 'sbreload|killall|launchctl' devkit/mkdeb.sh; then
+            echo "✗ mkdeb.sh 里出现 sbreload / killall / launchctl（会半装）"; exit 1
+          fi
+          grep -q 'format=tarfile.GNU_FORMAT' devkit/mkdeb.sh \
+            || { echo "✗ tar 没指定 GNU_FORMAT（PAX 头会让 dpkg 装不上）"; exit 1; }
+
+          echo "✓ 补丁在位（2.2-1）"
 
       - name: Source self-check (single source of truth)
         run: |
