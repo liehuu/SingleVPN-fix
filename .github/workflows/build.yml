@@ -35,12 +35,24 @@ jobs:
           cnt() { printf '%s' "$1" | grep -Fc -- "$2" || true; }
 
           echo "--- 0. 确认推上来的是 2.2-4（根本修复版），不是旧文件 ---"
+          # ★ 2.2-5：黑名单里的 SVPN_DIAG 必须按**完整标识符**匹配。
+          #   旧脚手架是裸宏开关 `#define SVPN_DIAG 0` + `#if SVPN_DIAG`，
+          #   而 2.2-5 新增的诊断常量叫 SVPN_DIAG_SLOTS / SVPN_DIAG_EXPORT_PATH ——
+          #   它们包含 "SVPN_DIAG" 这个子串，用子串判会把新代码误判成旧结构
+          #   （本轮就是这样把 CI 搞红的，且报错信息还指向「推的不是 2.2-5」，
+          #   方向上完全是误导）。
+          #   用进程替换做单词边界匹配：grep -qw 不支持带换行的长串，
+          #   所以逐行判，前后不能紧邻 [A-Za-z0-9_]。
           for old in gSVPNOriginals SVPNRememberOriginal SVPNRestorePaintedViewsNow \
-                     gSVPNPainted kSVPNStyleKey SVPN_DIAG SVPN_DISABLE_ENTRY_MERGE; do
+                     gSVPNPainted kSVPNStyleKey SVPN_DISABLE_ENTRY_MERGE; do
             if printf '%s' "$CODE" | grep -q -- "$old"; then
-              echo "✗ 源码里还有旧结构 $old —— 推的不是 2.2-4"; exit 1
+              echo "✗ 源码里还有旧结构 $old —— 推的不是 2.2-5"; exit 1
             fi
           done
+          # SVPN_DIAG 单独判：只认裸的宏开关，不认 SVPN_DIAG_xxx
+          if printf '%s' "$CODE" | grep -Eq '(^|[^A-Za-z0-9_])SVPN_DIAG([^A-Za-z0-9_]|$)'; then
+            echo "✗ 源码里还有旧诊断脚手架 SVPN_DIAG（裸宏开关）—— 推的不是 2.2-5"; exit 1
+          fi
           echo "  ✓ 旧结构已清空"
 
           echo "--- 1. 启动窗口闸门（2.1-8，实测通过，必须保留）---"

@@ -948,6 +948,59 @@ chk("S12q 设置页不用 section 序号当判据（插一段就漂移）",
     "indexPath.section ==" not in _pm_nc and "indexPath.section==" not in _pm_nc,
     "残留 %d 处" % (_pm_nc.count("indexPath.section")))
 
+# ============================================================================
+print("\n[S13] CI shell 判据与 Python 闸门的一致性")
+# ============================================================================
+# ★★ 为什么要有这一组（2.2-5 真实踩到）：
+#    build.yml 里有一整套 shell 判据（Verify patch presence），它跑在
+#    Python 闸门**之前**。本轮新增诊断层用了 SVPN_DIAG_SLOTS /
+#    SVPN_DIAG_EXPORT_PATH，而那个黑名单里有一条裸子串判据 "SVPN_DIAG"
+#    （历史遗留的旧诊断脚手架是个裸宏开关）—— 子串命中，CI 直接红，
+#    报错信息还写着「推的不是 2.2-5」，方向完全误导。
+#
+#    这正是本项目反复记录的「禁项闸门不能用泛词」：判据锚的是子串，
+#    不锚标识符边界，任何以它为前缀的新名字都会被误伤。
+#    而这条判据在 Python 侧没有任何对应物，所以本地全绿、CI 才红。
+#
+#    这一组的职责：把「CI 会误伤新代码」这件事变成**本地就能发现**的。
+_yml = io.open(YML, encoding="utf-8").read()
+
+# ① CI 的黑名单条目不许用「可能成为别的标识符前缀」的裸子串。
+#    判法：对每个黑名单条目，检查源码里所有以它开头的**更长标识符**。
+#    （例外：条目本身已经足够长且唯一，如 gSVPNOriginals —— 用长度阈值区分。）
+_blacklist = []
+_m = re.search(r"for old in ([^;]+); do", _yml)
+if _m:
+    _blacklist = [t for t in _m.group(1).replace("\\", " ").split() if t and not t.startswith("$")]
+_blacklist = [t.strip('"\'') for t in _blacklist]
+_ambig = []
+for _bad in _blacklist:
+    if len(_bad) < 10:      # 短名字最容易成为别人的前缀
+        _longer = sorted({t for t in re.findall(r"\b%s[A-Za-z0-9_]+\b" % re.escape(_bad), src)})
+        if _longer:
+            _ambig.append("%s → %s" % (_bad, _longer[:3]))
+chk("S13a CI 旧结构黑名单里没有会误伤新标识符的短子串",
+    not _ambig, "歧义 %s" % _ambig)
+
+# ② 裸 SVPN_DIAG（旧脚手架）必须按完整标识符匹配，不能子串匹配。
+#    旧写法是 `#define SVPN_DIAG 0` + `#if SVPN_DIAG`；新常量是 SVPN_DIAG_xxx。
+#    判据：yml 里必须出现单词边界正则，且不能把 SVPN_DIAG 留在 for old 列表里。
+_has_word_boundary = "SVPN_DIAG([^A-Za-z0-9_]" in _yml or "SVPN_DIAG\\b" in _yml
+chk("S13b CI 对裸 SVPN_DIAG 用单词边界匹配（否则 SVPN_DIAG_SLOTS 会被误伤）",
+    _has_word_boundary and "SVPN_DIAG " not in _m.group(1) if _m else False,
+    "边界正则=%s / 仍在 for old 列表=%s"
+    % (_has_word_boundary,
+       ("SVPN_DIAG " in _m.group(1)) if _m else None))
+
+# ③ ★★ 反向：源码里确实存在 SVPN_DIAG_xxx，而裸 SVPN_DIAG 不存在。
+#    这条防的是「判据虽然改了，但改的方向不对」——比如把正则写成
+#    只认带下划线的，那真出现旧脚手架时反而抓不到。
+_diag_prefixed = len(re.findall(r"\bSVPN_DIAG_[A-Z_]+\b", src))
+_bare_diag = len(re.findall(r"(^|[^A-Za-z0-9_])SVPN_DIAG([^A-Za-z0-9_]|$)", nc, re.M))
+chk("S13c 源码有 SVPN_DIAG_ 前缀常量但没有裸 SVPN_DIAG（判据两侧都成立）",
+    _diag_prefixed >= 2 and _bare_diag == 0,
+    "带前缀 %d 个 / 裸的 %d 个" % (_diag_prefixed, _bare_diag))
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:

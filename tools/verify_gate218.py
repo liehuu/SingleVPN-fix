@@ -34,6 +34,9 @@ FILES = {
     #   下一轮跑闸门会看到一堆莫名其妙的失败。
     "m": os.path.join(_REPO, "SingleVPNPrefs", "SingleVPNRootListController.m"),
     "pl": os.path.join(_REPO, "SingleVPNPrefs", "Resources", "Root.plist"),
+    # ★ 2.2-5：CI workflow 也进了还原清单。S13 组判的就是它的 shell 判据，
+    #   注入后必须能改回来，否则下一轮 verify 步骤会莫名其妙地假红。
+    "yml": os.path.join(_REPO, ".github", "workflows", "build.yml"),
 }
 _orig = {k: io.open(p, encoding="utf-8", newline="").read() for k, p in FILES.items()}
 
@@ -613,6 +616,29 @@ CASES = [
                 "    if (indexPath.section == 2) { return [super tableView:tableView cellForRowAtIndexPath:indexPath]; }\n"
                 "    PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];",
                 "S12q 设置页不用 section 序号当判据", file="m"),
+
+    # ---------------------------------------------------------------
+    # S13 CI shell 判据一致性（2.2-5 真实踩到的 CI 假红）
+    # ---------------------------------------------------------------
+    # ★ 这一组防的是「本地全绿、CI 红」——本轮真的发生了：
+    #   CI 的旧结构黑名单用裸子串 "SVPN_DIAG"，而新诊断常量叫
+    #   SVPN_DIAG_SLOTS，子串命中 → CI 红，报错还写着「推的不是 2.2-5」。
+    one_replace("B97 黑名单里加回短子串 SVPN_DIAG（会误伤 SVPN_DIAG_SLOTS）",
+                "for old in gSVPNOriginals SVPNRememberOriginal SVPNRestorePaintedViewsNow \\\n"
+                "                     gSVPNPainted kSVPNStyleKey SVPN_DISABLE_ENTRY_MERGE; do",
+                "for old in gSVPNOriginals SVPNRememberOriginal SVPNRestorePaintedViewsNow \\\n"
+                "                     gSVPNPainted kSVPNStyleKey SVPN_DIAG SVPN_DISABLE_ENTRY_MERGE; do",
+                "S13a CI 旧结构黑名单", file="yml"),
+
+    one_replace("B98 把 SVPN_DIAG 的单词边界判定改回子串 grep（判据方向反了）",
+                "if printf '%s' \"$CODE\" | grep -Eq '(^|[^A-Za-z0-9_])SVPN_DIAG([^A-Za-z0-9_]|$)'; then",
+                "if printf '%s' \"$CODE\" | grep -q 'SVPN_DIAG'; then",
+                "S13b CI 对裸 SVPN_DIAG 用单词边界匹配", file="yml"),
+
+    one_replace("B99 源码里混进旧脚手架裸 SVPN_DIAG（该报的必须报）",
+                "#define SVPN_DIAG_SLOTS 256",
+                "#define SVPN_DIAG 0\n#define SVPN_DIAG_SLOTS 256",
+                "S13c 源码有 SVPN_DIAG_ 前缀常量但没有裸 SVPN_DIAG"),
 
     # ---------------------------------------------------------------
     # S9 版本号一致性
