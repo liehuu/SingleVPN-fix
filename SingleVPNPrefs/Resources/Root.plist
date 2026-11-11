@@ -104,6 +104,22 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
+			<string>Diagnostics</string>
+			<key>footerText</key>
+			<string>If the status bar icons disappear, tap “Export Diagnostics” and then toggle the VPN once. Then send me the file at /var/mobile/Library/Preferences/com.82flex.singlevpn-diag.txt — it records what the system actually handed to the tweak, which is the only way to tell “icons not drawn” apart from “wrong colour”.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>Export Diagnostics</string>
+			<key>action</key>
+			<string>exportDiagnostics</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
 			<string></string>
 		</dict>
 		<dict>

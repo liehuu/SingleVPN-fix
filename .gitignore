@@ -146,3 +146,8 @@ _SingleVPN_gen.mm
 _art/
 _oldcheck/
 _bak_*
+
+# Python 字节码（跑闸门会产生；进仓库没有意义，
+# 而且 pyc 里带着本机绝对路径，CI 上纯属噪音）
+__pycache__/
+*.pyc

@@ -333,21 +333,33 @@ def main():
             b"getRed:green:blue:alpha:" in dy and b"colorWithRed:green:blue:alpha:" in dy)
         chk(f + " 有 setActiveColor: / setInactiveColor:",
             b"setActiveColor:" in dy and b"setInactiveColor:" in dy)
-        # ★ 不能判「setTintColor: 完全不出现」：iOS16 基线分支里上游原本就有
-#   一处 [imageView setTintColor:newColor]（我们按约定逐字保留那段）。
-#   产物里它表现为 2 次：__objc_methname 的选择子名 1 次 +
-#   __objc_selrefs 的指针表项 1 次。
-#   所以判据是「恰好 2 次」，比 2 多就说明 iOS17 那一路把 tint 加回来了。
-        chk(f + " tint 槽位只在 iOS16 基线里（恰好 2 处：methname + selref）",
-            dy.count(b"setTintColor:") == 2,
-            "命中 %d 次" % dy.count(b"setTintColor:"))
-        # @"tint" 这个字典 key 是我们自己加的槽位名，源码里已彻底删除，
-        # 产物里也不该有。
-        chk(f + " 没有自定义的 @\"tint\" 槽位 key",
-            b"\x00tint\x00" not in dy,
+        # ★★ 2.2-4 方向反转。
+        #    2.2-3 时这条判「恰好 2 次」（只有 iOS16 基线那一处上游代码）——
+        #    但 2.2-4 把 tint 槽位加回了还原 plan，蜂窝/WiFi 图标吃
+        #    imageTintColor，没有它断开后图标永远不褪色。
+        #    现在基线 2 次 + 我们新增的 selref 1 次 = 3 次。
+        #    少于 3 → tint 槽位又丢了；多于 3 → 有重复引用。
+        _ntint = dy.count(b"setTintColor:")
+        chk(f + " tint 槽位在位（≥3 处：基线 2 + 还原 plan 的 selref）",
+            _ntint >= 3,
+            "命中 %d 次（2.2-3 时为 2）" % _ntint)
+        # @"tint" 是还原 plan 里的槽位 key，也是账本字典的 key。
+        # 产物里必须存在 —— 不存在说明 plan 或 SVPNRecord 的 tint 那笔没了。
+        chk(f + " ★ 有自定义的 @\"tint\" 槽位 key（还原入口存在的证明）",
+            b"\x00tint\x00" in dy,
             "命中 %d 次" % dy.count(b"\x00tint\x00"))
-        chk(f + " 没有 setNeedsDisplay / setNeedsLayout（还原不重绘）",
-            b"setNeedsDisplay" not in dy and b"setNeedsLayout" not in dy)
+        # ★★ 2.2-4 方向反转：还原路径**必须**标脏重绘。
+        #    2.2-2 把这条写成「不许出现」，直接导致了「断开不褪色」。
+        #    setActiveColor: 只存 ivar 不标脏，还原发生在系统链路之外，
+        #    不自己 setNeedsDisplay 就是「值改了屏幕不变」。
+        chk(f + " ★ 有 setNeedsDisplay（还原后标脏重绘的编译级证据）",
+            b"setNeedsDisplay" in dy,
+            "命中 %d 次" % dy.count(b"setNeedsDisplay"))
+        # 反向：仍然不许有 setNeedsLayout —— 布局重算跟换色无关，
+        # 出现只说明有人又在还原路径里顺手动了布局。
+        chk(f + " 没有 setNeedsLayout（还原只需重绘，不需重排）",
+            b"setNeedsLayout" not in dy,
+            "命中 %d 次" % dy.count(b"setNeedsLayout"))
 
         # ★★ 符号级证据：2.2-2 的结构性修复真的编进了产物。
         #   这一组是唯一能区分 2.2-1 与 2.2-2 的产物判据：
@@ -364,9 +376,41 @@ def main():
             not any(k in low for k in ("SVPNHeal", "SVPNMarkSeen", "gSVPNSeen")),
             "命中 %d 处" % sum(1 for k in ("SVPNHeal", "SVPNMarkSeen", "gSVPNSeen")
                               if k in low))
+        # ★★ 2.2-4 删掉的「按界面外观记账」机制，产物里必须一处不剩。
+        #    这是确定性的负向证据：这两个符号在 2.2-3 产物里是存在的，
+        #    若在新产物里还能找到，说明有人把外观门槛又加回来了 ——
+        #    而那正是「断开不褪色」的原 bug。
+        chk(f + " ★ 没有外观门槛的残留符号（断开不褪色原 bug 的编译级反证）",
+            not any(k in low for k in ("SVPNUserInterfaceStyle", "SVPN_STYLE_KEY")),
+            "命中 %d 处" % sum(1 for k in ("SVPNUserInterfaceStyle", "SVPN_STYLE_KEY")
+                              if k in low))
         chk(f + " 没有 dispatch 定时器相关符号（不做轮询）",
             "_dispatch_source_create" not in low,
             "命中 %d" % low.count("_dispatch_source_create"))
+
+        # ★★ 2.2-5 诊断层真的编进产物了。
+        #    为什么必须从产物这一侧判、而不是只判源码：
+        #    诊断代码全在 @try 里、返回值没人用，是最容易被编译器当成
+        #    「无效代码」整块删掉的形式。源码里写着、产物里没有，
+        #    用户装了却导不出任何文件 —— 而且看起来像「插件没生效」，
+        #    会被误判成染色逻辑的问题，白跑一整轮。
+        #    静态函数名会留在 LC_SYMTAB 字符串表里（__ZL… 或 SVPN 前缀），
+        #    这是编译级硬证据，比段大小可靠（段大小会随任何无关改动漂移）。
+        _diag_syms = [s for s in ("SVPNNote", "SVPNExportDiag", "SVPNColorKind",
+                                  "SVPNMaybeExport", "SVPNEventName")
+                      if s in low]
+        chk(f + " ★ 诊断层编进产物了（否则用户装了点导出什么都没发生）",
+            len(_diag_syms) >= 4,
+            "命中 %d/5: %s" % (len(_diag_syms), _diag_syms))
+        # 反向：诊断层不许把「事后自愈」那一套带回来（S11f 的产物级对应）。
+        chk(f + " 诊断层没有引入日志/自愈符号（只留证据，不介入）",
+            not any(k in low for k in ("SVPNHeal", "SVPNMarkSeen")),
+            "命中 %d" % sum(1 for k in ("SVPNHeal", "SVPNMarkSeen") if k in low))
+        # ★ 导出文件路径是字面量，会原样留在 __cstring 里。
+        #   用户就是按这个路径去找文件，路径错了整轮诊断白跑。
+        chk(f + " 导出文件路径字面量在产物里",
+            b"/var/mobile/Library/Preferences/com.82flex.singlevpn-diag.txt" in dy,
+            "命中 %d" % dy.count(b"com.82flex.singlevpn-diag.txt"))
     print()
 
     print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

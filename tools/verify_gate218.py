@@ -29,6 +29,11 @@ PY = sys.executable
 FILES = {
     "x": os.path.join(_REPO, "SingleVPN.x"),
     "mk": os.path.join(_REPO, "devkit", "mkdeb.sh"),
+    # ★ 2.2-5 起设置页也进了闸门（S12n/S12o/S12p/S12q 判的就是它）。
+    #   判据覆盖了文件却不在还原清单里 = 注入后永远改不回来，
+    #   下一轮跑闸门会看到一堆莫名其妙的失败。
+    "m": os.path.join(_REPO, "SingleVPNPrefs", "SingleVPNRootListController.m"),
+    "pl": os.path.join(_REPO, "SingleVPNPrefs", "Resources", "Root.plist"),
 }
 _orig = {k: io.open(p, encoding="utf-8", newline="").read() for k, p in FILES.items()}
 
@@ -61,6 +66,23 @@ def replace_first(name, old, new, expect_gate, file="x"):
         assert old in s, "%s：锚点未命中" % name
         return s.replace(old, new, 1)
     return (name, file, fn, expect_gate)
+
+
+def _bump_mk_version(s):
+    """把 mkdeb.sh 里 printf 的版本号改掉一位（不依赖具体数字）。
+
+    ★ 为什么不用 one_replace 写死 "2.2-4"：版本号一升版，写死的锚点
+      就命中 0 次，整轮反向验证在断言处中断 —— 那是用例过期，
+      不是判据失效，但看起来一模一样，会把人带偏。
+    """
+    import re as _re
+    m = _re.search(r"(SingleVPN\s+)([\w.\-]+)(\s+已安装)", s)
+    assert m, "mkdeb.sh 里找不到已安装提示"
+    old_ver = m.group(2)
+    bump = old_ver[:-1] + "9" if old_ver[:-1] != old_ver[-1] else old_ver + "9"
+    if bump == old_ver:
+        bump = old_ver + "9"
+    return s[:m.start(2)] + bump + s[m.end(2):]
 
 
 CASES = [
@@ -101,8 +123,8 @@ CASES = [
                 "            gSVPNReady = 1;",
                 "S2c 闸门开在主队列"),
     one_replace("B08 闸门被两处置 1（提前放行）",
-                "            gSVPNReady = 1;\n        }\n    );",
-                "            gSVPNReady = 1;\n            gSVPNReady = 1;\n        }\n    );",
+                "            gSVPNReady = 1;\n            // 记下闸门打开的时刻",
+                "            gSVPNReady = 1;\n            gSVPNReady = 1;\n            // 记下闸门打开的时刻",
                 "S2d 闸门只在一处被置 1"),
     replace_first("B09 染色判定绕过统一入口（自己拼 Ready 条件）",
                   "    if (SVPNDecision() && inactiveColor) {",
@@ -142,10 +164,10 @@ CASES = [
                   "S4b 数据层不改写系统 data"),
     one_replace("B15 _updateWithAggregatedData 重新赋值 data",
                 "- (void)_updateWithAggregatedData:(STStatusBarData *)data {\n"
-                "    if (gSVPNReady) {",
+                "    // ★ 诊断记录放在闸门",
                 "- (void)_updateWithAggregatedData:(STStatusBarData *)data {\n"
                 "    data = data;\n"
-                "    if (gSVPNReady) {",
+                "    // ★ 诊断记录放在闸门",
                 "S4c _updateWithAggregatedData 不重新赋值 data"),
 
     # ---------------------------------------------------------------
@@ -210,8 +232,10 @@ CASES = [
                 "",
                 "S6e 还原前重新确认当前不该染"),
     one_replace("B27 还原丢掉启动闸门（respring 窗口内就介入视图）",
-                "static void SVPNRestoreNow(void) {\n    if (!gSVPNReady) {\n        return;\n    }\n",
-                "static void SVPNRestoreNow(void) {\n",
+                "    SVPNMaybeExport();\n\n    if (!gSVPNReady) {\n        return;\n    }\n"
+                "    // 延后执行期间可能已经重新连上，此时擦色就是新 bug",
+                "    SVPNMaybeExport();\n\n"
+                "    // 延后执行期间可能已经重新连上，此时擦色就是新 bug",
                 "S6f 还原有独立闸门"),
     one_replace("B28 边遍历 NSMapTable 边改它（未定义行为）",
                 "        for (id v in gSVPNLedger) {\n            if (v) {",
@@ -475,12 +499,129 @@ CASES = [
                 "S11n 不用界面外观当还原门槛"),
 
     # ---------------------------------------------------------------
+    # S12 诊断层（2.2-5）
+    # ---------------------------------------------------------------
+    # ★ 这一组要回答的问题不是「诊断代码写没写」，而是
+    #   「这版诊断包放出去会不会白跑一轮」——那才是真代价。
+    #   每一例都对应一种「白跑」：崩宿主 / 拖慢 / 记不到 / 路径对不上。
+    one_replace("B80 环形缓冲改成 0 槽（导出永远是空的，白跑一轮）",
+                "#define SVPN_DIAG_SLOTS 256",
+                "#define SVPN_DIAG_SLOTS 1",
+                "S12a 环形缓冲有静态数组"),
+
+    one_replace("B81 SVPNNote 忘了推进序号（导出恒为第 0 条）",
+                "    gSVPNSeq = e->seq;\n",
+                "",
+                "S12b SVPNNote 推进序号与计数"),
+
+    one_replace("B82 热路径里加了 NSLog（每条钩子都打日志，状态栏卡顿）",
+                "    e->extra = extra;\n",
+                "    e->extra = extra;\n    NSLog(@\"note %u\", ev);\n",
+                "S12c SVPNNote 体内无分配"),
+
+    one_replace("B83 落盘不包 @try（IO 抛异常直接崩 SpringBoard）",
+                "    @try {\n        SVPNExportDiag();\n    } @catch (NSException *e) {\n    }",
+                "    SVPNExportDiag();",
+                "S12d 落盘被 @try 包住"),
+
+    one_replace("B84 标志判断挪进 @try（每条钩子都建 setjmp）",
+                "    if (!gSVPNExportRequest) {\n        return;\n    }\n"
+                "    gSVPNExportRequest = 0;\n    @try {",
+                "    @try {\n    if (!gSVPNExportRequest) {\n        return;\n    }\n"
+                "    gSVPNExportRequest = 0;",
+                "S12d 落盘被 @try 包住"),
+
+    one_replace("B85 闸门打开时顺手落盘一次（多一条写入路径）",
+                "            gSVPNReady = 1;\n            // 记下闸门打开的时刻",
+                "            gSVPNReady = 1;\n            SVPNExportDiag();\n            // 记下闸门打开的时刻",
+                "S12e 落盘只由 SVPNMaybeExport 触发"),
+
+    one_replace("B86 导出路径写到 /tmp（rootless 下用户取不到）",
+                '#define SVPN_DIAG_EXPORT_PATH "/var/mobile/Library/Preferences/com.82flex.singlevpn-diag.txt"',
+                '#define SVPN_DIAG_EXPORT_PATH "/tmp/com.82flex.singlevpn-diag.txt"',
+                "S12f 导出路径在 /var/mobile 下"),
+
+    one_replace("B86b 去掉 stdio.h 靠传递包含（本地过、CI 报 implicit declaration）",
+                "#import <stdio.h>   // snprintf —— 不能靠 UIKit 的传递包含，那是实现细节\n",
+                "",
+                "S12f2 诊断层用到的 POSIX 接口都有显式头文件"),
+
+    one_replace("B87 热路径里也把导出标志置 1（每帧落盘）",
+                "    e->extra = extra;\n",
+                "    e->extra = extra;\n    gSVPNExportRequest = 1;\n",
+                "S12g 导出请求标志只由通知回调置 1"),
+
+    # ★★ 下面三条是本轮的核心：诊断能不能回答问题，全看记录点在哪一行。
+    replace_first("B88 视图记录点挪到染色判断之后（看不到「没被调用」）",
+                  "    @try {\n        SVPNNote(SVPNEvWifiInactive, inactiveColor, 0);\n    } @catch (NSException *e) {\n    }\n"
+                  "    SVPNMaybeExport();\n\n    if (SVPNDecision() && inactiveColor) {",
+                  "    if (SVPNDecision() && inactiveColor) {\n"
+                  "        @try {\n            SVPNNote(SVPNEvWifiInactive, inactiveColor, 0);\n        } @catch (NSException *e) {\n        }\n"
+                  "        SVPNMaybeExport();",
+                  "S12h 六个视图钩子的记录点"),
+
+    one_replace("B89 数据层记录点塞进 gSVPNReady 里（启动窗口被挖掉）",
+                "    @try {\n        STStatusBarDataEntry *vpnProbe = data ? data.vpnEntry : nil;\n"
+                "        SVPNNote(SVPNEvDataAggregated, nil, vpnProbe ? (vpnProbe.enabled ? 1u : 2u) : 0u);\n"
+                "    } @catch (NSException *e) {\n    }\n    SVPNMaybeExport();\n\n"
+                "    if (gSVPNReady) {\n        @try {\n"
+                "            // 只认本轮 data 携带的条目",
+                "    if (gSVPNReady) {\n        @try {\n"
+                "            STStatusBarDataEntry *vpnProbe = data ? data.vpnEntry : nil;\n"
+                "            SVPNNote(SVPNEvDataAggregated, nil, vpnProbe ? (vpnProbe.enabled ? 1u : 2u) : 0u);\n"
+                "        } @catch (NSException *e) {\n        }\n        SVPNMaybeExport();\n"
+                "        @try {\n"
+                "            // 只认本轮 data 携带的条目",
+                "S12i 数据层记录点在 gSVPNReady 闸门之外"),
+
+    one_replace("B90 定义了事件枚举却从不记录（日志里永远看不到那类事件）",
+                "    SVPNEvGateOpen         = 10,  // 闸门打开\n};",
+                "    SVPNEvGateOpen         = 10,  // 闸门打开\n    SVPNEvUnused           = 99,\n};",
+                "S12j 每个事件枚举都被真的记录"),
+
+    one_replace("B91 诊断版本串没跟着升版（日志对不上产物）",
+                '#define SVPN_VERSION_STR "2.2-5"',
+                '#define SVPN_VERSION_STR "2.2-4"',
+                "S12k 诊断版本串"),
+
+    one_replace("B92 通知回调少写形参（签名对不上，靠 ABI 巧合运行）",
+                "static void SVPNPrefsChanged(CFNotificationCenterRef center,\n"
+                "                             void *observer,\n"
+                "                             CFStringRef name,\n"
+                "                             const void *object,\n"
+                "                             CFDictionaryRef userInfo) {",
+                "static void SVPNPrefsChanged(void) {",
+                "S12l 两个 Darwin 通知回调都是五参数签名"),
+
+    one_replace("B93 设置页 plist 的 action 名写岔（点了按钮什么都不发生）",
+                "<string>exportDiagnostics</string>",
+                "<string>exportDiag</string>",
+                "S12n 设置页有导出 action", file="pl"),
+
+    one_replace("B94 两侧通知名不一致（设置页发的通知插件收不到）",
+                'CFSTR("com.82flex.singlevpnprefs/exportdiag")',
+                'CFSTR("com.82flex.singlevpnprefs/exportdiag2")',
+                "S12o 导出通知名在插件侧与设置页侧完全一致", file="m"),
+
+    one_replace("B95 两侧导出路径不一致（用户按提示找不到文件）",
+                '@"/var/mobile/Library/Preferences/com.82flex.singlevpn-diag.txt"',
+                '@"/var/mobile/Library/Preferences/com.82flex.singlevpn-diag.log"',
+                "S12p 导出文件路径两侧是同一个完整字面量", file="m"),
+
+    one_replace("B96 设置页又用 section 序号当判据（插一段就漂移）",
+                "    PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];",
+                "    if (indexPath.section == 2) { return [super tableView:tableView cellForRowAtIndexPath:indexPath]; }\n"
+                "    PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];",
+                "S12q 设置页不用 section 序号当判据", file="m"),
+
+    # ---------------------------------------------------------------
     # S9 版本号一致性
     # ---------------------------------------------------------------
-    one_replace("B57 版本号三处不一致（装着 2.2-4，报 2.1-11）",
-                "SingleVPN 2.2-4 已安装",
-                "SingleVPN 2.1-11 已安装",
-                "S9a 三处版本号一致", file="mk"),
+    # ★ 不写死版本号的字面量：写死 "2.2-4" 的话，每次升版这条用例
+    #   就在锚点断言处直接报「命中 0 次」而整轮中断 —— 那是用例自己过期，
+    #   不是判据失效。改成「把任意版本号改成另一个」。
+    ("B57 版本号三处不一致（mkdeb 报的版本与源码对不上）",
+     "mk", _bump_mk_version, "S9a 三处版本号一致"),
 ]
 
 
@@ -523,7 +664,8 @@ def main():
     assert rc == 0, "最终复跑不干净：\n" + out[-1200:]
     for k, p in FILES.items():
         assert io.open(p, encoding="utf-8", newline="").read() == _orig[k], "文件没还原: " + k
-    print("\n✓ 反向验证全过（%d 例，零 SKIP），两个文件均已还原且复跑干净" % passed)
+    print("\n✓ 反向验证全过（%d 例，零 SKIP），%d 个文件均已还原且复跑干净"
+          % (passed, len(FILES)))
 
 
 if __name__ == "__main__":

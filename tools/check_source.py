@@ -704,6 +704,250 @@ chk("S11n 不用界面外观当还原门槛（间接代理指标，取错就整�
     "SVPNUserInterfaceStyle" not in nc and "SVPN_STYLE_KEY" not in nc,
     "残留 %d 处" % (nc.count("SVPNUserInterfaceStyle") + nc.count("SVPN_STYLE_KEY")))
 
+# ============================================================================
+print("\n[S12] 诊断层（2.2-5：只在异常时留证据，不改染色行为）")
+# ============================================================================
+# ★★ 为什么这一组必须存在：
+#    2.2-5 新增约 200 行诊断代码，而 [S11] 那 74 项一条都没碰到它 ——
+#    全绿但新代码零覆盖，就是「装饰性通过」（本项目的头号自欺形态）。
+#    这一组按两个问题来写：
+#      (a) 诊断会不会自己变成新 bug？→ 绝不能崩宿主、绝不能拖慢热路径
+#      (b) 诊断能不能真的回答问题？  → 记录点必须在判断之前、在闸门外
+#    这两类里任何一条不成立，这版诊断包就白跑了。
+
+# ① 环形缓冲的结构必须成立，且尺寸是「够看完一次复现」的量级。
+#    太小会在复现前就被覆盖掉（这就是最典型的白跑）。
+def _define_int(name):
+    _m = re.search(r"#define\s+" + re.escape(name) + r"\s+(\d+)", src)
+    return int(_m.group(1)) if _m else None
+
+_slots = _define_int("SVPN_DIAG_SLOTS")
+chk("S12a 环形缓冲有静态数组 + 固定槽位数（够覆盖一次复现）",
+    "static SVPNEvent gSVPNRing[SVPN_DIAG_SLOTS];" in nc
+    and _slots is not None and 64 <= _slots <= 4096,
+    "SVPN_DIAG_SLOTS=%s" % _slots)
+
+# ② 序号与计数必须真的在推进，否则导出的会是「永远是第 0 条」。
+_note_body = body_of("static inline void SVPNNote(", nc)
+chk("S12b SVPNNote 推进序号与计数（不推进则导出恒为旧数据）",
+    bool(_note_body)
+    and "gSVPNSeq = e->seq;" in _note_body
+    and "gSVPNRingCount = gSVPNRingCount + 1;" in _note_body,
+    "体 %d 字节" % len(_note_body))
+
+# ③ ★★ 热路径红线：SVPNNote 内不许出现任何分配 / IO / 锁。
+#    这里判的是**函数体**，不是文件里有没有这些词 —— 导出函数里必然有
+#    open/write/snprintf，用全文判会把这函数判红（判据锚错地方）。
+_ring_forbidden = [t for t in ("alloc", "NSString", "NSLog", "printf", "open(",
+                               "write(", "dispatch_", "pthread_mutex", "@synchronized",
+                               "os_unfair", "NSFileManager")
+                   if t in _note_body]
+chk("S12c SVPNNote 体内无分配 / 无 IO / 无锁（热路径必须极便宜）",
+    bool(_note_body) and not _ring_forbidden,
+    "命中 %s" % _ring_forbidden)
+
+# ④ ★★ 诊断层的最高红线：绝不崩宿主。
+#    落盘要真做 IO，必须被 @try 包住 —— 但**不能**因此把整条热路径包进 @try
+#    （每条钩子都建 setjmp 的成本不可忽略）。所以要判两件事：
+#      先判标志（便宜路径直接 return） → 再 @try 包住真正的 IO。
+_maybe_body = body_of("static inline void SVPNMaybeExport(", nc)
+_maybe_head_guard = re.search(r"if\s*\(\s*!\s*gSVPNExportRequest\s*\)\s*\{?\s*return", _maybe_body) is not None
+_maybe_tries_export = re.search(r"@try\s*\{\s*SVPNExportDiag\(\);", _maybe_body) is not None
+chk("S12d 落盘被 @try 包住，且标志判断在 @try 之前（便宜路径不建 setjmp）",
+    bool(_maybe_body) and _maybe_head_guard and _maybe_tries_export,
+    "体 %d 字节 / 前置判标志=%s / @try包住落盘=%s"
+    % (len(_maybe_body), _maybe_head_guard, _maybe_tries_export))
+
+# ⑤ 导出只在「被显式请求」时发生 —— 不许自动落盘、不许定时落盘。
+#    自动落盘会在崩溃/卡顿时留下半截文件，而且时机不可控。
+_export_callers = [m.start() for m in re.finditer(r"SVPNExportDiag\(\)", nc)]
+# 扣除它自己的定义处
+_def_at = nc.find("static void SVPNExportDiag(void) {")
+_callers = [i for i in _export_callers if i > _def_at + 10]
+_export_ok = True
+for _i in _callers:
+    # 每个调用点必须落在 SVPNMaybeExport 体内
+    _in_maybe = _maybe_body and (_i >= nc.find("static inline void SVPNMaybeExport(") and
+                                 _i <= nc.find("static inline void SVPNMaybeExport(") + len(_maybe_body))
+    if not _in_maybe:
+        _export_ok = False
+chk("S12e 落盘只由 SVPNMaybeExport 触发（无第二条写入路径）",
+    _export_ok and len(_callers) == 1,
+    "调用点数 %d（应为 1）" % len(_callers))
+
+# ★ 这里原本写的「S12f 不做定时落盘」已删除：它和 S11g 用同一个条件
+#   （dispatch_source_create 在不在）判同一件事，一次注入会同时点亮两条，
+#   反向用例就没办法断言「是哪一条拦下的」。定时器这一条已由 S11g 覆盖。
+#   换成另一个角度：导出路径必须是 /var/mobile 下的绝对路径 ——
+#   否则用户在 Filza / 终端里找不到（rootless 下 / 只有只读挂载）。
+_diag_path_m = re.search(r'#define\s+SVPN_DIAG_EXPORT_PATH\s+"([^"]+)"', src)
+_diag_path = _diag_path_m.group(1) if _diag_path_m else ""
+chk("S12f 导出路径在 /var/mobile 下且是绝对路径（用户能在 Filza 里取到）",
+    _diag_path.startswith("/var/mobile/") and ".." not in _diag_path,
+    "path=%s" % _diag_path)
+
+# ★ 诊断层用到的每个 POSIX 接口，其头文件都必须**显式**导入。
+#   这是典型的「本地看着对、CI 才报错」：UIKit 会传递包含一部分，
+#   靠传递包含活着，SDK 一变就 unknown type / implicit declaration。
+#   本机没有 Xcode，编译错只能等 CI，一次失败一次往返 —— 所以在这里拦。
+_need_headers = {
+    "snprintf": "stdio.h",
+    "open(": "fcntl.h",
+    "write(": "unistd.h",
+    "close(": "unistd.h",
+    "clock_gettime": "time.h",
+    "dlopen": "dlfcn.h",
+}
+_hdr_missing = []
+for _sym, _hdr in _need_headers.items():
+    if _sym in nc and ("#import <%s>" % _hdr) not in nc and ("#include <%s>" % _hdr) not in nc:
+        _hdr_missing.append("%s 需要 %s" % (_sym, _hdr))
+chk("S12f2 诊断层用到的 POSIX 接口都有显式头文件（不靠传递包含）",
+    not _hdr_missing, "缺失 %s" % _hdr_missing)
+chk("S12g 导出请求标志只由通知回调置 1（不在热路径里置 1 → 否则每帧落盘）",
+    # ★ 原来这条写的是「不许 dispatch_after 里调落盘」，但它和 S12e
+    #   （唯一调用点）判的是同一件事：任何新增调用点都会先点亮 S12e。
+    #   两条同时红就没法断言「是哪一条拦下的」。改成另一个真正独立的角度：
+    #   标志位是谁置的。置 1 不等于调用，与 S12e 不重合。
+    nc.count("gSVPNExportRequest = 1;") == 1
+    and len(re.findall(r"gSVPNExportRequest\s*=\s*1;", nc)) == 1
+    and body_of("static void SVPNRequestExport(", nc).count("gSVPNExportRequest = 1;") == 1,
+    "置 1 处数 %d" % nc.count("gSVPNExportRequest = 1;"))
+
+# ⑥ ★★ 诊断能不能回答问题，全看记录点在哪一行。
+#    SVPNNote 必须在**染色判断之前** —— 只有在那之前，
+#    「日志里没这条」才能解释成「方法没被调用」（视图没建）。
+#    写在 if (SVPNDecision()) 里面，就只能在「我们决定染色」时才记，
+#    而那时视图显然存在 —— 恰好把最想观察的那一半挖掉。
+# ★ 这条不许只判「先后顺序」（在循环体内插一句非法调用顺序也没变）。
+#   必须把方法体取出来，单独断言 SVPNNote 落在第一个 if 之前。
+_view_hooks = {
+    "StringView.applyStyleAttributes:": ("- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs", "%hook STUIStatusBarStringView"),
+    "WifiSignal.applyStyleAttributes:": ("- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs", "%hook STUIStatusBarWifiSignalView"),
+    "WifiSignal.setActiveColor:": ("- (void)setActiveColor:(UIColor *)activeColor", "%hook STUIStatusBarWifiSignalView"),
+    "WifiSignal.setInactiveColor:": ("- (void)setInactiveColor:(UIColor *)inactiveColor", "%hook STUIStatusBarWifiSignalView"),
+    "StringView.setText:": ("- (void)setText:(NSString *)text", "%hook STUIStatusBarStringView"),
+    "CellNetType.setText:prefix:...": ("- (void)setText:(NSString *)text prefixLength:(NSInteger)prefixLength", "%hook STUIStatusBarCellularNetworkTypeView"),
+}
+_note_before_decision_fails = []
+for _lbl, (_sig, _hook) in _view_hooks.items():
+    # 按类切段：同一个 selector 在多个类里都有，不切段会锚错（踩过）
+    _seg = nc[nc.find(_hook):] if nc.find(_hook) >= 0 else ""
+    if _seg:
+        _nxt = _seg.find("%hook", 1)
+        if _nxt > 0:
+            _seg = _seg[:_nxt]
+    _b = body_of(_sig, _seg)
+    if not _b:
+        _note_before_decision_fails.append(_lbl + "(取不到函数体)")
+        continue
+    _p_note = _b.find("SVPNNote(")
+    _p_dec = _b.find("SVPNDecision()")
+    _p_ready = _b.find("gSVPNReady")
+    _first_guard = min([p for p in (_p_dec, _p_ready) if p >= 0], default=-1)
+    if _p_note < 0:
+        _note_before_decision_fails.append(_lbl + "(没有记录点)")
+    elif _first_guard >= 0 and _p_note > _first_guard:
+        _note_before_decision_fails.append(_lbl + "(记录点在第 %d 字符，晚于判断 %d)" % (_p_note, _first_guard))
+chk("S12h 六个视图钩子的记录点全部在染色判断之前（否则看不到「没被调用」）",
+    not _note_before_decision_fails,
+    "问题项 %s" % _note_before_decision_fails)
+
+# ⑦ ★★ 数据层记录必须在闸门**外面**。
+#    gSVPNReady 的启动窗口正是最可疑的一段时间（respring 后图标空白），
+#    把记录放进 if (gSVPNReady) 里，等于把要观察的那段挖掉。
+_data_ok_fails = []
+for _sig in ("- (void)_updateWithAggregatedData:(STStatusBarData *)data",
+             "- (void)_updateWithData:(STStatusBarData *)data completionHandler:(id)handler"):
+    _b = body_of(_sig, nc)
+    if not _b:
+        _data_ok_fails.append(_sig[:40] + "(取不到函数体)")
+        continue
+    _p_note = _b.find("SVPNNote(")
+    _p_ready = _b.find("if (gSVPNReady)")
+    if _p_note < 0:
+        _data_ok_fails.append(_sig[:40] + "(没有记录点)")
+    elif _p_ready >= 0 and _p_note > _p_ready:
+        _data_ok_fails.append(_sig[:40] + "(记录点落在闸门内)")
+chk("S12i 数据层记录点在 gSVPNReady 闸门之外（启动窗口才看得见）",
+    not _data_ok_fails, "问题项 %s" % _data_ok_fails)
+
+# ⑧ 事件枚举必须**每个都被真的用到**，且每个都有名字。
+#    定义了不用 = 装饰性代码：日志里永远看不到那一类事件，
+#    而人会以为「没出现 = 没发生」（本项目明确禁止的推论）。
+_ev_names = re.findall(r"\b(SVPNEv\w+)\s*=", src)
+_ev_unused = [n for n in _ev_names if nc.count(n + ",") + nc.count(n + ")") == 0]
+_ev_noname = [n for n in _ev_names if ('case %s:' % n) not in nc]
+chk("S12j 每个事件枚举都被真的记录、且都有可读名字",
+    bool(_ev_names) and not _ev_unused and not _ev_noname,
+    "枚举 %d 个 / 未使用 %s / 无名字 %s" % (len(_ev_names), _ev_unused, _ev_noname))
+
+# ⑨ 版本串必须与三处版本号一致，否则导出的日志对不上「哪一版跑出来的」。
+_ver_src = re.search(r'#define\s+SVPN_VERSION_STR\s+"([\w.\-]+)"', src)
+chk("S12k 诊断版本串与 S9a 的版本号一致（日志要能对上产物）",
+    _ver_src is not None and _ver_src.group(1) == _vers.get("Makefile"),
+    "src=%s / Makefile=%s" % (_ver_src.group(1) if _ver_src else None, _vers.get("Makefile")))
+
+# ⑩ ★★ Darwin 通知回调必须是五参数签名。
+#    原来直接把 ReloadPrefs（无参函数）当回调传 —— arm64 上多余参数落寄存器
+#    被忽略所以「看起来能用」，但那是 ABI 巧合。
+#    判据：两个回调都不能是裸的 ReloadPrefs，且都必须有五个形参。
+_cb_fails = []
+for _cb in ("SVPNRequestExport", "SVPNPrefsChanged"):
+    _m = re.search(r"static void " + _cb + r"\s*\(([^)]*)\)", nc)
+    if not _m:
+        _cb_fails.append(_cb + "(没有定义)")
+        continue
+    _params = [p for p in _m.group(1).split(",") if p.strip()]
+    if len(_params) != 5:
+        _cb_fails.append("%s(%d 个形参)" % (_cb, len(_params)))
+chk("S12l 两个 Darwin 通知回调都是五参数签名（不再拿无参函数当回调）",
+    not _cb_fails, "问题项 %s" % _cb_fails)
+chk("S12m 不再把 ReloadPrefs 直接注册成通知回调",
+    "CFNotificationCallback)ReloadPrefs" not in nc
+    and "(CFNotificationCallback)SVPNPrefsChanged" in nc
+    and "(CFNotificationCallback)SVPNRequestExport" in nc)
+
+# ⑪ ★★ 设置页那一侧：action 名、通知名、文件路径三处必须与插件侧严格一致。
+#    这三处任一处写岔，用户点了按钮却什么都没发生 —— 而且看起来像「插件没生效」，
+#    会被误判成染色逻辑的问题，白跑一轮。
+_prefs_m = os.path.join(_REPO, "SingleVPNPrefs", "SingleVPNRootListController.m")
+_prefs_plist = os.path.join(_REPO, "SingleVPNPrefs", "Resources", "Root.plist")
+_pm = io.open(_prefs_m, encoding="utf-8").read() if os.path.exists(_prefs_m) else ""
+_pp = io.open(_prefs_plist, encoding="utf-8").read() if os.path.exists(_prefs_plist) else ""
+_pm_nc = strip_code(_pm)
+
+chk("S12n 设置页有导出 action，且 Root.plist 里的 action 名与之相符",
+    "- (void)exportDiagnostics" in _pm_nc
+    and "<string>exportDiagnostics</string>" in _pp,
+    "m 定义=%s / plist 引用=%s"
+    % ("- (void)exportDiagnostics" in _pm_nc, "<string>exportDiagnostics</string>" in _pp))
+
+# 通知名两侧必须字面量完全相同（跨进程唯一契约）
+_notif_plugin = re.search(r'CFSTR\("([^"]*exportdiag)"\)', src)
+_notif_prefs = re.search(r'CFSTR\("([^"]*exportdiag)"\)', _pm)
+chk("S12o 导出通知名在插件侧与设置页侧完全一致",
+    _notif_plugin is not None and _notif_prefs is not None
+    and _notif_plugin.group(1) == _notif_prefs.group(1),
+    "插件侧=%s / 设置页=%s"
+    % (_notif_plugin.group(1) if _notif_plugin else None,
+       _notif_prefs.group(1) if _notif_prefs else None))
+
+# 文件路径两侧必须一致 —— 用户按提示去找，找不到就会以为插件没生效。
+# 所以要求两侧各有一个**完整的**路径字面量（不是拆成两段拼接）。
+_path_plugin = re.search(r'#define\s+SVPN_DIAG_EXPORT_PATH\s+"([^"]+)"', src)
+_path_prefs_lits = re.findall(r'@?"(/var/mobile/[^"]+)"', _pm)
+chk("S12p 导出文件路径两侧是同一个完整字面量（不拆段拼接）",
+    _path_plugin is not None
+    and _path_plugin.group(1) in _path_prefs_lits,
+    "插件侧=%s / 设置页侧=%s"
+    % (_path_plugin.group(1) if _path_plugin else None, _path_prefs_lits[:3]))
+
+# ⑫ ★ 设置页不能再用段落序号当判据（会随布局漂移）。
+chk("S12q 设置页不用 section 序号当判据（插一段就漂移）",
+    "indexPath.section ==" not in _pm_nc and "indexPath.section==" not in _pm_nc,
+    "残留 %d 处" % (_pm_nc.count("indexPath.section")))
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:
