@@ -162,8 +162,8 @@ CASES = [
                 "static UIColor *svpnReplaceKeepingAlphaXX(UIColor *original, UIColor *hue) {",
                 "S5b 存在保 alpha 的换色函数"),
     one_replace("B18 保 alpha 函数改用 hue 自己的 alpha（等于没保）",
-                "        return [UIColor colorWithRed:r green:g blue:b alpha:sa];",
-                "        return [UIColor colorWithRed:r green:g blue:b alpha:a];",
+                "    return SVPNColorRGBA(r, g, b, sa);",
+                "    return SVPNColorRGBA(r, g, b, a);",
                 "S5c 保 alpha 函数真的取了原色 alpha"),
     one_replace("B19 setInactiveColor 绕过保 alpha",
                 "UIColor *paint = svpnReplaceKeepingAlpha(inactiveColor,"
@@ -171,13 +171,16 @@ CASES = [
                 "UIColor *paint = svpnReplacementFor(inactiveColor);",
                 "S5d setInactiveColor 走保 alpha"),
     one_replace("B20 dimmed 色绕过保 alpha",
-                "                UIColor *dimmed = svpnReplaceKeepingAlpha(sysDimmed ?: sysTint, hue);",
+                "                UIColor *dimmed = svpnReplaceKeepingAlpha(dimmedAnchor, hue);",
                 "                UIColor *dimmed = hue;",
                 "S5e imageDimmedTintColor 走保 alpha"),
-    one_replace("B21 写死一个小 alpha（同样是看不见）",
-                "    _lightReplacementColor = l ?: [UIColor colorWithRed:0.196 green:0.780 blue:0.349 alpha:1];",
-                "    _lightReplacementColor = l ?: [UIColor colorWithRed:0.196 green:0.780 blue:0.349 alpha:0.2];",
-                "S5f 不写死 alpha 常量"),
+    one_replace("B21 兜底色写死一个小 alpha（同样是看不见）",
+                "    _lightReplacementColor = l ?: SVPNColorRGBA(0.196, 0.780, 0.349, 1.0);",
+                "    _lightReplacementColor = l ?: SVPNColorRGBA(0.196, 0.780, 0.349, 0.2);",
+                # ★ 2.2-2 起 S11c（alpha 只有两个来源）会先拦住它 ——
+                #   这比 S5f 更根本：S5f 只看「有没有写死小数」，S11c 直接
+                #   限定 alpha 只能从系统原色或常量 1.0 来。断言最根本的那条。
+                "S11c alpha 只有两个来源"),
 
     # ---------------------------------------------------------------
     # S6 还原账本
@@ -299,7 +302,7 @@ CASES = [
     # S8 颜色边界
     # ---------------------------------------------------------------
     one_replace("B47 替换色去掉兜底（nil 会把图标色清空）",
-                "    _lightReplacementColor = l ?: [UIColor colorWithRed:0.196 green:0.780 blue:0.349 alpha:1];",
+                "    _lightReplacementColor = l ?: SVPNColorRGBA(0.196, 0.780, 0.349, 1.0);",
                 "    _lightReplacementColor = l;",
                 "S8a 替换色有兜底"),
     one_replace("B48 取系统色失败时返回 nil（放弃染色）",
@@ -344,10 +347,65 @@ CASES = [
                 "S10g PAX 扩展头运行期检查真的会抛错", file="mk"),
 
     # ---------------------------------------------------------------
+    # S11 ★★ 结构性不变量（2.2-2 根本修复）
+    #
+    # 这一组的用例和 B16-B21 的区别：B16-B21 测「某一行改对了」，
+    # 这一组测「坏色根本造不出来」。所以注入的是**结构性的退化**：
+    # 重新允许在别处造色、把 alpha 来源放开、把事后补救机制加回来。
+    # ---------------------------------------------------------------
+    one_replace("B58 ★ 在别处新增一个造色点（绕开唯一入口）",
+                "static void ReloadPrefs(void) {",
+                "static UIColor *svpnAdHocColor(void) {\n"
+                "    return [UIColor colorWithRed:1 green:0 blue:0 alpha:0.05];\n"
+                "}\n\n"
+                "static void ReloadPrefs(void) {",
+                "S11a 全工程只有一处造色"),
+    one_replace("B59 造色入口自己写死 alpha（调用方再也压不下去也没意义）",
+                "        return [UIColor colorWithRed:r green:g blue:b alpha:a];",
+                "        a = 1.0;\n        return [UIColor colorWithRed:r green:g blue:b alpha:a];",
+                # 注入后 SVPNColorRGBA 体内出现 alpha:1.0 之外的写死 —— 由 S11b 拦
+                "S11b 造色入口不篡改 alpha 参数"),
+    one_replace("B60 配置色改成半透明（alpha 不再恒为 1）",
+                "    _darkReplacementColor = d ?: SVPNColorRGBA(0.173, 0.816, 0.341, 1.0);",
+                "    _darkReplacementColor = d ?: SVPNColorRGBA(0.173, 0.816, 0.341, 0.35);",
+                "S11c alpha 只有两个来源"),
+    one_replace("B61 色相变量直接塞进 UI 槽位（绕过系统 alpha）",
+                "            UIColor *paint = svpnReplaceKeepingAlpha(sysTextColor, svpnReplacementFor(sysTextColor));",
+                "            UIColor *paint = svpnReplacementFor(sysTextColor);",
+                "S11d 色相变量从不直接进 UI 槽位"),
+    one_replace("B62 setActiveColor 退回直接塞纯色相（激活格不再跟随系统淡出）",
+                "UIColor *paint = svpnReplaceKeepingAlpha(activeColor, svpnReplacementFor(activeColor));",
+                "UIColor *paint = svpnReplacementFor(activeColor);",
+                "S11d 色相变量从不直接进 UI 槽位"),
+    one_replace("B63 ★ 把「事后扫描修复」加回来（治标：允许坏色先进来）",
+                "static void SVPNRestoreAsync(void) {",
+                "static void SVPNHealNow(const char *r) { (void)r; }\n\n"
+                "static void SVPNRestoreAsync(void) {",
+                "S11f 没有事后扫描修复机制"),
+    one_replace("B64 加回定时轮询（长期和系统抢同一个属性）",
+                "static void SVPNRestoreAsync(void) {",
+                "static void svpnStartPoll(void) {\n"
+                "    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,\n"
+                "                                                 dispatch_get_main_queue());\n"
+                "    (void)t;\n"
+                "}\n\n"
+                "static void SVPNRestoreAsync(void) {",
+                "S11g 不做定时轮询"),
+    one_replace("B65 染色路径里加一次强制重绘（和系统绘制节奏打架）",
+                "            if (paint) {\n"
+                "                SVPNRecord(self, @\"ac\", activeColor, paint);\n"
+                "                activeColor = paint;\n            }",
+                "            if (paint) {\n"
+                "                [self setNeedsDisplay];\n"
+                "                SVPNRecord(self, @\"ac\", activeColor, paint);\n"
+                "                activeColor = paint;\n            }",
+                "S11h 染色路径里不主动重绘"),
+
+    # ---------------------------------------------------------------
     # S9 版本号一致性
     # ---------------------------------------------------------------
-    one_replace("B57 版本号三处不一致（装着 2.2-1，报 2.1-11）",
-                "SingleVPN 2.2-1 已安装",
+    one_replace("B57 版本号三处不一致（装着 2.2-2，报 2.1-11）",
+                "SingleVPN 2.2-2 已安装",
                 "SingleVPN 2.1-11 已安装",
                 "S9a 三处版本号一致", file="mk"),
 ]

@@ -285,13 +285,15 @@ chk("S5b 存在保 alpha 的换色函数",
     "static UIColor *svpnReplaceKeepingAlpha(UIColor *original, UIColor *hue)" in nc)
 _kp = body_of("static UIColor *svpnReplaceKeepingAlpha(UIColor *original, UIColor *hue)", nc)
 chk("S5c 保 alpha 函数真的取了原色 alpha 并沿用它",
+    # ★ 造色已收进 SVPNColorRGBA，所以这里判「取原色 alpha」+「把 sa 原样交出去」。
+    #   仍判死 'alpha:&sa'：这是唯一一次读 alpha，没有第二个来源。
     "getRed:&sr green:&sg blue:&sb alpha:&sa" in _kp
-    and "colorWithRed:r green:g blue:b alpha:sa" in _kp,
+    and "SVPNColorRGBA(r, g, b, sa)" in _kp,
     "函数体 %d 字节" % len(_kp))
 chk("S5d setInactiveColor 走保 alpha 路径",
     "svpnReplaceKeepingAlpha(inactiveColor," in _g17)
 chk("S5e imageDimmedTintColor 走保 alpha 路径",
-    "svpnReplaceKeepingAlpha(sysDimmed ?: sysTint, hue)" in _g17)
+    "svpnReplaceKeepingAlpha(dimmedAnchor, hue)" in _g17)
 chk("S5f 不写死 alpha 常量",
     re.search(r"colorWithRed:[^\]]*alpha:0\.\d", nc) is None)
 
@@ -495,6 +497,77 @@ chk("S10g PAX 扩展头运行期检查真的会抛错",
     and _mk_code.count("_check_no_pax_headers(") >= 3,
     "函数体 %d 字节；定义+调用 %d 处" % (
         len(_pax), _mk_code.count("_check_no_pax_headers(")))
+
+# ============================================================================
+print("\n[S11] 结构性不变量：坏色没有产生的机会（2.2-2 根本修复）")
+# ============================================================================
+# 为什么这一组比 S5 更重要：
+#   S5 判的是「这一版那几行改对了」。下一版有人再写一处 [UIColor colorWithRed:...
+#   alpha:0.05]，S5 全绿但图标又没了。所以要把「能不能造出看不见的色」变成
+#   **结构问题**：
+#     ① 全工程只有一处造色（SVPNColorRGBA）；
+#     ② 它的 alpha 只有两个来源，一个是常量 1.0，一个是系统原色的 alpha；
+#     ③ 所有染色调用点都必须经过 svpnReplaceKeepingAlpha（不许直接塞纯色相）。
+#   这样一来「压缩 alpha」这件事在代码结构里根本没有位置。
+
+# ① 唯一造色入口。判「UIColor colorWithRed:」在非注释代码里只出现一次。
+_make = [ln for ln, t in enumerate(nc.split("\n"), 1) if "UIColor colorWithRed:" in t]
+chk("S11a 全工程只有一处造色（SVPNColorRGBA）",
+    len(_make) == 1,
+    "命中 %d 处，行号 %s" % (len(_make), _make))
+_rgba = body_of("static UIColor *SVPNColorRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a)", nc)
+# ★ 判「函数体不许对 a 重新赋值」，而不是判「有没有出现 alpha:1」。
+#   后者太弱：写一句 `a = 1.0;` 就绕过去了（反向验证 B59 抓到过）。
+_reassign_a = re.search(r"(?<![\w.>])a\s*=[^=]", _rgba) is not None
+chk("S11b 造色入口不篡改 alpha 参数（收到什么就用什么）",
+    bool(_rgba) and "alpha:a" in _rgba and not _reassign_a,
+    "函数体 %d 字节 / 重新赋值 a: %s" % (len(_rgba), _reassign_a))
+
+# ② alpha 的两个合法来源：常量 1.0（配置兜底）、系统原色 sa（换色）。
+_calls = [ln.strip() for ln in nc.split("\n") if "SVPNColorRGBA(" in ln
+          and "static UIColor *SVPNColorRGBA" not in ln]
+_bad_alpha = [c for c in _calls if ("SVPNColorRGBA(r, g, b, sa)" not in c
+                                    and ", 1.0)" not in c)]
+chk("S11c alpha 只有两个来源：系统原色的 sa / 常量 1.0",
+    bool(_calls) and not _bad_alpha,
+    "调用 %d 处，可疑 %d 处: %s" % (len(_calls), len(_bad_alpha), _bad_alpha[:2]))
+
+# ③ 所有染色点都保 alpha。判法不是「不许用 svpnReplacementFor」——
+#    它本来就只负责挑色相，只有 3 个参数、没有 alpha 概念。
+#    真正要判的是：**色相变量有没有被直接送进 UI 槽位**。
+#    直接塞进去 = 用了色相自带的 alpha（=1），绕过系统的 alpha → 就是原来的 bug。
+# ★ 组的结束标记 "%end // SingleVPN_17" 是**注释**，在 nc 里已被抹成空格，
+#   所以边界要用原文 src 定位。两个 strip 函数都是逐字符等长替换，
+#   索引可以通用。
+_g17n = nc[src.index("%group SingleVPN_17"):src.index("%end // SingleVPN_17")]
+_direct = []
+for _m in re.finditer(r"UIColor \*(\w+)\s*=\s*svpnReplacementFor\(", _g17n):
+    _var = _m.group(1)
+    # 该变量在 17 组里的每一次使用，都必须在 svpnReplaceKeepingAlpha(x, var) 里
+    for _u in re.finditer(r"\b" + re.escape(_var) + r"\b", _g17n):
+        _ctx = _g17n[max(0, _u.start() - 80):_u.end() + 30]
+        _is_def = "UIColor *" + _var in _ctx
+        if _is_def:
+            continue
+        if not re.search(r"svpnReplaceKeepingAlpha\([^;]*\b" + re.escape(_var) + r"\b", _ctx):
+            _direct.append(_var + " @ " + _ctx.replace("\n", " ").strip()[:70])
+            break
+chk("S11d 色相变量从不直接进 UI 槽位（必须先包保 alpha）",
+    not _direct,
+    "裸用 %d 处: %s" % (len(_direct), _direct[:2]))
+chk("S11e 五个染色点全部经过保 alpha 包装",
+    _g17n.count("svpnReplaceKeepingAlpha(") >= 5,
+    "17 组内命中 %d 处" % _g17n.count("svpnReplaceKeepingAlpha("))
+
+# ④ 不许有「事后补救」的机制。这类机制的存在本身就说明允许坏色先进来。
+#    反面词用精确 selector/符号，不用泛词（避免误伤注释与正常代码）。
+chk("S11f 没有事后扫描修复机制（坏色应从源头消灭）",
+    "SVPNHeal" not in nc and "SVPNMarkSeen" not in nc and "gSVPNSeen" not in nc,
+    "残留 %d 处" % (nc.count("SVPNHeal") + nc.count("SVPNMarkSeen") + nc.count("gSVPNSeen")))
+chk("S11g 不做定时轮询（不长期和系统抢同一属性）",
+    "DISPATCH_SOURCE_TYPE_TIMER" not in nc and "dispatch_source_create" not in nc)
+chk("S11h 染色路径里不主动重绘（只在系统自己的绘制链路内换色）",
+    "setNeedsDisplay" not in nc and "setNeedsLayout" not in nc)
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

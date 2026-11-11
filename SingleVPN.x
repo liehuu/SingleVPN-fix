@@ -1,12 +1,12 @@
 // ============================================================================
 // SingleVPN —— 状态栏 VPN 染色
 //
-// 2.2-1：重写。
-// 上一版（2.1-x 系列）在「还原机制」上叠了四轮补丁，每次修完又冒出新症状。
-// 重新写一遍，只保留经过实测确认的机制，其余全部删掉。
+// 2.2-2：根本修复版。
+// 22-1 是重写；2.2-2 只做一件事：把「图标看不见」从**源头**堵死，
+// 并把堵法变成代码结构，而不是靠某几行写对。
 //
 // 保留的四条（都有用户实测背书，缺一不可）：
-//   ① 启动 5 秒闸门 —— respring 后主屏状态栏实例在那一刻建成，插件介入会把
+//   ① 启动 0.5 秒闸门 —— respring 后主屏状态栏实例在那一刻建成，插件介入会把
 //      它建成残缺状态，且 iOS 17 之后不会重建。整体挪出启动窗口即可（2.1-8）。
 //   ② VPN 状态只认本轮 data —— 与上一轮快照做或运算会把断开时的 YES 永久
 //      锁存，导致断开不褪色（2.1-9）。
@@ -14,16 +14,19 @@
 //      系统不重发样式，上一轮的色就留在视图上（2.1-10）。
 //   ④ 换色相时保住系统 alpha —— 这是「桌面不定期图标空白」的真正根因（2.1-12）。
 //
-// 删掉的三类：
+// 删掉的四类：
 //   · 诊断/取证脚手架（SVPN_DIAG 整块、日志双通道、心跳计数、地址去重）
-//     它们只在排查期需要；留在交付版里是热路径负担与新的干扰源。
 //   · entry 回填（svpnMergeMissingEntries）
 //     回填源是「已经渲染出去的上一轮数据」，respring/切换网络时可能是
 //     「存在但 enabled=NO」的空壳，塞回渲染管线 = 图标整块空白。
 //   · 还原机制的过度设计（全局外观 flag、tint 槽位、强制重绘）
-//     详见下面「还原」一节的注释。
+//   · ★ 2.2-2 删掉的「事后扫描自愈」（2.2-1 里加过一版）——
+//     它先允许坏色写进去，再用「alpha < 0.25」这个启发式认出来、重写、重绘。
+//     那是治标：启发式必然误判（系统本来就会给低 alpha），且它在系统流程
+//     之外改状态栏私有视图，和原版那个 bug 属于同一类动作。
+//     详见文件中部「不变量」一节的注释。
 //
-// ★★ 关于「图标空白」的定性（这一版最重要的一条，别再走错方向）：
+// ★★ 关于「图标空白」的定性（最重要的一条，别再走错方向）：
 //   用户实测：桌面不定期「信号条 + WiFi 一起彻底空着，连轮廓都没有」，
 //   深浅色背景都出现过，改一下网络或过一会儿自己恢复，**且原版也有**。
 //   「原版也有」这一条排除了所有 2.1-x 新写的代码 —— 根因在上游染色里：
@@ -36,8 +39,12 @@
 //     浅色壁纸 → rgb(214,244,222) ≈ 全白
 //   两边都「看不见」。改网络/等一会儿恢复，是系统重新下发样式把 alpha 改回去。
 //
-//   所以本版的核心修复是：**只换 RGB，alpha 沿用原色的**。
-//   这样「未激活格比激活格淡」这个系统语义保持不变，我们只负责换色相。
+//   核心修复：**只换 RGB，alpha 沿用系统原色的**。
+//   2.2-2 把它升级成结构性保证（见下面「造色唯一入口」）：
+//     · 全工程只有 SVPNColorRGBA 一处造色；
+//     · 它的 alpha 只有两个来源：常量 1.0（配置兜底）、系统原色的 sa；
+//     · 所有染色点都必须经过 svpnReplaceKeepingAlpha，色相不直接进 UI 槽位。
+//   于是「压掉 alpha」在代码里没有位置，不是「这一版恰好没写」。
 // ============================================================================
 
 // ★ 不要 import <HBLog.h> / <substrate.h>：本工程是「零 Theos」构建
@@ -130,6 +137,26 @@ static BOOL _isForce5GAEnabled = NO;    // 强制显示 5GA
 static UIColor *_darkReplacementColor = nil;   // 系统色偏深时用（浅色底上的深色文字）
 static UIColor *_lightReplacementColor = nil;  // 系统色偏浅时用
 
+// ---------------------------------------------------------------------------
+// 造色：全工程唯一入口（2.2-2 的结构性修复）
+//
+// ★★ 为什么要把「造一个颜色」收成一处：
+//   上游把图标弄没的写法是 [绿色 colorWithAlphaComponent:0.2] —— 一次手滑就能
+//   把 alpha 从 1 压到 0.2，图标立刻消失。只要允许代码里散落着写
+//   [UIColor colorWithRed:... alpha:...]，「能造出多小的 alpha」就是个
+//   靠人自觉的问题，总有下一次手滑。
+//   收成一处之后它变成**结构性**问题：全工程只有这一处造色，而它的调用方
+//   只有两个 —— 一个恒定给 1.0（配置色兜底），一个给「系统原色的 alpha」。
+//   闸门于是可以判「全工程只有一处造色」，这比逐个盯调用点强得多。
+// ---------------------------------------------------------------------------
+static UIColor *SVPNColorRGBA(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
+    @try {
+        return [UIColor colorWithRed:r green:g blue:b alpha:a];
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
 static void ReloadPrefs(void) {
     static NSUserDefaults *prefs = nil;
     if (!prefs) {
@@ -154,8 +181,9 @@ static void ReloadPrefs(void) {
     }
     // 设置里没配就用默认绿。★ 这里必须有兜底：颜色为 nil 会让染色路径
     // 走进「写 nil」的分支，等于把图标颜色清空。
-    _lightReplacementColor = l ?: [UIColor colorWithRed:0.196 green:0.780 blue:0.349 alpha:1];
-    _darkReplacementColor = d ?: [UIColor colorWithRed:0.173 green:0.816 blue:0.341 alpha:1];
+    // alpha 恒为 1：这是「色相本身」，不含任何透明度语义。
+    _lightReplacementColor = l ?: SVPNColorRGBA(0.196, 0.780, 0.349, 1.0);
+    _darkReplacementColor = d ?: SVPNColorRGBA(0.173, 0.816, 0.341, 1.0);
 }
 
 // ============================================================================
@@ -213,11 +241,9 @@ static UIColor *svpnReplaceKeepingAlpha(UIColor *original, UIColor *hue) {
     if (![hue getRed:&r green:&g blue:&b alpha:&a]) {
         return hue;
     }
-    @try {
-        return [UIColor colorWithRed:r green:g blue:b alpha:sa];
-    } @catch (NSException *e) {
-        return hue;
-    }
+    // ★ 唯一的 alpha 来源是 sa（系统原色的 alpha）。
+    //   这里没有任何一条路径的 alpha 来自我们自己 —— 想压也压不下去。
+    return SVPNColorRGBA(r, g, b, sa);
 }
 
 // ============================================================================
@@ -467,6 +493,39 @@ static void SVPNRestoreNow(void) {
     }
 }
 
+// ============================================================================
+// 不变量：颜色只能从 SVPNColorRGBA 出来
+// ============================================================================
+//
+// 上一版在这里放了一整套「扫描 → 发现 alpha 太低 → 重写颜色 → 重绘」的自愈。
+// 它被删掉了，理由是它是**治标**：
+//
+//   · 它先允许坏色被写进去，再靠 alpha < 0.25 这个**启发式**去认出来。
+//     启发式一定会有误判：系统在某些场景下（未激活格、淡出动画、按压态）
+//     本来就给低 alpha，"低 alpha = 坏" 这个前提并不成立。
+//   · 它在系统的更新流程之外写视图属性（setNeedsDisplay / setXxxColor）。
+//     而「在系统流程外改状态栏私有视图」正是原版那个 bug 的同一类动作 ——
+//     系统不会知道我们改过，也不会纠正，只会越改越偏。
+//   · 定时器 2 秒扫一轮，等于让插件长期和系统抢同一个属性。
+//
+// 根本修法是把「坏色」这类值从**源头**消灭，而不是事后认出来：
+//
+//   ① 全工程只有 SVPNColorRGBA 一处造色。闸门 S11a/S11b 判它就是唯一一处。
+//   ② 它的调用方只有两个，alpha 各自被钉死：
+//        · ReloadPrefs 兜底色  → alpha 恒 1.0（色相本身，不含透明度语义）
+//        · svpnReplaceKeepingAlpha → alpha 来自**系统原色**的 sa
+//      没有任何一条路径的 alpha 来自我们自己，想压也压不下去。
+//   ③ 染色只发生在系统自己的调用栈里（applyStyleAttributes: / setXxxColor:），
+//      也就是系统「本来就在重画」的时刻。系统流程之外不写任何视图属性。
+//
+// 结果：图标看不见这件事**没有发生的机会**，而不是「发生了再修」。
+//
+// 那用户说的「切一下网络就回来了」还需要额外做什么？
+//   不需要。VPN 连接状态变化必然改变 vpnEntry → 系统必然重发数据 →
+//   _updateWithData: / _updateWithAggregatedData: 被调用 → %orig 触发
+//   完整重绘 → applyStyleAttributes: 重新下发样式 → 我们在这条链路里
+//   按系统的 alpha 换色相。这条链路是系统自己的，不靠我们另外补一次重绘。
+
 static void SVPNRestoreAsync(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -479,6 +538,11 @@ static void SVPNRestoreAsync(void) {
 
 /// 每个数据层 hook 末尾调一次。两个 hook 都调，第二次 prev 已是 0，
 /// 不会重复触发 —— 天然去重，不需要额外的重入标志。
+///
+/// ★ 这里只处理「连 → 断」这一个状态迁移（触发还原）。
+///   反方向（断 → 连）什么都不做，因为不需要：
+///   连着 VPN 时系统会重发完整数据，染色链路（applyStyleAttributes: /
+///   setXxxColor:）由系统自己驱动，我们不补动作。
 static void SVPNNoteTransition(void) {
     if (!gSVPNReady) {
         return;
@@ -538,7 +602,9 @@ static void SVPNNoteTransition(void) {
         @try {
             // ★ 必须在 copy 之前读：改的是副本，原始入参才是系统本来要用的色
             UIColor *sysTextColor = styleAttrs.textColor;
-            UIColor *paint = svpnReplacementFor(sysTextColor);
+            // ★ 保 alpha：文字同样可能带系统给的 alpha（淡出/次要文字）。
+            //   只有「所有染色点一致保 alpha」才是一条不变量，而不是四处特例。
+            UIColor *paint = svpnReplaceKeepingAlpha(sysTextColor, svpnReplacementFor(sysTextColor));
             if (paint) {
                 STUIStatusBarStyleAttributes *copy = [styleAttrs copy];
                 [copy setTextColor:paint];
@@ -559,7 +625,7 @@ static void SVPNNoteTransition(void) {
         @try {
             // self.textColor 可能是我们上一轮染的（SVPNRecord 会识别并拒绝记账）
             UIColor *cur = self.textColor;
-            UIColor *paint = svpnReplacementFor(cur);
+            UIColor *paint = svpnReplaceKeepingAlpha(cur, svpnReplacementFor(cur));
             if (paint) {
                 [self setTextColor:paint];
                 SVPNRecord(self, @"tc", cur, paint);
@@ -577,8 +643,12 @@ static void SVPNNoteTransition(void) {
 - (void)setActiveColor:(UIColor *)activeColor {
     if (SVPNDecision() && activeColor) {
         @try {
-            // 入参就是系统本来要用的色 → 必须改之前记账
-            UIColor *paint = svpnReplacementFor(activeColor);
+            // 入参就是系统本来要用的色 → 必须改之前记账。
+            // ★ 激活格也走保 alpha：原来直接塞纯色相（alpha=1），
+            //   系统若正在淡出（切换动画里 alpha 由 1 渐变到 0），
+            //   我们把它钉死在 1 就等于跟系统的动画对着干。
+            //   两侧对称地「只换 RGB、alpha 一律沿用系统的」，才没有例外。
+            UIColor *paint = svpnReplaceKeepingAlpha(activeColor, svpnReplacementFor(activeColor));
             if (paint) {
                 SVPNRecord(self, @"ac", activeColor, paint);
                 activeColor = paint;
@@ -608,23 +678,39 @@ static void SVPNNoteTransition(void) {
 - (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
     if (SVPNDecision() && styleAttrs) {
         @try {
-            UIColor *sysTint = styleAttrs.imageTintColor ?: styleAttrs.textColor;
+            // 两个槽位各换各的：**alpha 一律沿用该槽位自己那份系统色**。
+            // ★ 不要拿 textColor 的 alpha 去染 imageTintColor 槽 ——
+            //   它们是两份独立的系统值，混用会在淡出/次要元素时算出错的透明度。
+            UIColor *sysText = styleAttrs.textColor;
+            UIColor *sysTint = styleAttrs.imageTintColor;
             UIColor *sysDimmed = styleAttrs.imageDimmedTintColor;
-            UIColor *hue = svpnReplacementFor(styleAttrs.textColor ?: sysTint);
+
+            // 色相只决定 RGB，来源优先级：文字色 > 图片 tint
+            UIColor *hue = svpnReplacementFor(sysText ?: sysTint);
             if (hue) {
                 STUIStatusBarStyleAttributes *copy = [styleAttrs copy];
-                [copy setImageTintColor:hue];
-                // ★★ dimmed 也要保 alpha：原来压到 0.2 同样会把次要元素弄没。
-                UIColor *dimmed = svpnReplaceKeepingAlpha(sysDimmed ?: sysTint, hue);
+
+                // tint 的 alpha 锚点：imageTintColor 没下发就拿 textColor 当参照
+                UIColor *tintAnchor = sysTint ?: sysText;
+                UIColor *tint = svpnReplaceKeepingAlpha(tintAnchor, hue);
+                if (tint) {
+                    [copy setImageTintColor:tint];
+                }
+
+                // dimmed 通常就是「淡一档的 tint」，系统原值本身带低 alpha。
+                // 沿用它的 alpha 正是我们要的效果 —— 比原来硬写 0.2 精确，
+                // 而且不会把「本来就该淡」的语义压成一个死值。
+                UIColor *dimmedAnchor = sysDimmed ?: tintAnchor;
+                UIColor *dimmed = svpnReplaceKeepingAlpha(dimmedAnchor, hue);
                 if (dimmed) {
                     [copy setImageDimmedTintColor:dimmed];
                 }
+
                 styleAttrs = copy;
                 // 这一路不记账：styleAttrs 是临时对象，改它只影响本次绘制。
                 // 要还原得落到具体视图上，而视图侧没有与 imageTintColor 对应的
                 // 安全 setter（setTintColor: 会传播到子视图）。
                 // 这一路的色本来就会在下一次样式下发时被自然覆盖。
-                (void)sysTint;
             }
         } @catch (NSException *e) {
         }
