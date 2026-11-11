@@ -314,8 +314,12 @@ _rec = body_of("static void SVPNRecord(id view, NSString *slot", nc)
 chk("S6c 残留识别：等于上次染的色就拒绝当系统色记账",
     "if (lastPainted && [lastPainted isEqual:systemColor])" in _rec,
     "记账函数体 %d 字节" % len(_rec))
-chk("S6d 记账时把外观存进该视图自己的字典",
-    '[d setObject:@(style) forKey:SVPN_STYLE_KEY];' in _rec)
+# ★★ 2.2-4：S6d/S6h/S6i 原来是「记账时存外观 + 还原时比对外观」，
+#    那条设计已删除（外观是间接代理指标，取错就整视图不还原）。
+#    判据方向随之反转：现在必须**没有**外观记账与外观比对。
+chk("S6d 不再按界面外观记账（撤销永远比保留染色安全）",
+    "SVPN_STYLE_KEY" not in _rec and "SVPNUserInterfaceStyle" not in _rec,
+    "记账函数体 %d 字节" % len(_rec))
 _now = body_of("static void SVPNRestoreNow(void)", nc)
 chk("S6e 还原前重新确认当前不该染（断开又秒连不擦色）",
     "if (SVPNDecision()) {" in _now and _now.find("if (SVPNDecision()) {") < _now.find("SVPNRestoreSlot"))
@@ -335,38 +339,76 @@ chk("S6g 先收集再处理（边遍历边改 NSMapTable 是未定义行为）",
     "收集循环体 %d 字节；顺序 %d<%d" % (
         len(_collect), _now.find("for (id v in gSVPNLedger)"),
         _now.find("for (id view in views)")))
-chk("S6h 逐视图外观比对，不符只跳过该视图（不清表）",
-    "if (styleNow >= 0 && rec && [rec intValue] != styleNow) {" in _now
-    and "removeAllObjects" not in _now)
-chk("S6i 还原侧绕过缓存拿新鲜外观",
-    "SVPNUserInterfaceStyle(YES)" in _now)
+# ★★ 2.2-4：原 S6h 要求「逐视图外观比对，不符只跳过该视图」。
+#    那条正是「断开不褪色」的根因之一 —— 它把整个视图放过去了。
+#    现在改成逐槽位判「当前值还是不是我染的」，方向反转。
+chk("S6h ★ 不用外观比对当还原门槛（不符就跳过 = 留着绿色不撤）",
+    "int styleNow" not in _now
+    and "[rec intValue] != styleNow" not in _now
+    and "SVPNUserInterfaceStyle" not in _now,
+    "还原体 %d 字节" % len(_now))
+# ★ 与 S6h 分开：S6h 只判「外观门槛已去掉」，
+#   S6i 判「有没有换成直接判据」。两条判据各管一件事，
+#   否则一条注入会同时点亮两条，反向用例的 expect 就没法精确定位。
+chk("S6i ★ 逐槽位判「当前值是否仍是我染的」（直接判据，替代外观比对）",
+    "UIColor *cur = SVPNReadColor(view, getter);" in _now
+    and "[cur isEqual:painted]" in _now)
 chk("S6j 处理完销账（账本不跨周期复用）",
     _now.count("[gSVPNLedger removeObjectForKey:view];") == 1)
-# ★ 这条判的是三个 @"字面量" 在不在 → 必须用保留字符串的文本（ns）。
+# ★ 这条判的是 @"字面量" 在不在 → 必须用保留字符串的文本（ns）。
 #   用 nc（strip_code 抹掉字符串内容）会永远 FAIL，那就是判据写错方向。
 _now_ns = body_of("static void SVPNRestoreNow(void)", ns)
-chk("S6k 只碰 tc/ac/ic 三个槽位（不含会传播的 tint）",
-    '@[@"tc", @"setTextColor:", @"textColor"]' in _now_ns
-    and '@[@"ac", @"setActiveColor:", @"activeColor"]' in _now_ns
-    and '@[@"ic", @"setInactiveColor:", @"inactiveColor"]' in _now_ns
-    and '@"tint"' not in _now_ns
-    and "setTintColor:" not in _now,
+# ★★ 2.2-4：原来判「不含会传播的 tint」。实测否决了这条推断 ——
+#    2.1-10 用 setTintColor: 还原 tint 且有用户实测背书；而删掉它
+#    等于蜂窝/WiFi 图标永远没有还原入口（「断开不褪色」的第三处缺口）。
+#    现在改为要求 tint **必须在** plan 里，且带 @NO（不做当前值校验）。
+# ★ 2.2-4：条目多了第 4 个元素（是否做「当前值校验」的开关），
+#   所以这里判「槽位 + setter」前缀，不判整行相等 —— 整行相等是脆指标，
+#   加一个字段就红，红了人就去改判据，闸门慢慢退化成摆设。
+chk("S6k ★ 还原覆盖 tc/ac/ic/tint 四路（tint 缺了 icon 就不褪色）",
+    all(s in _now_ns for s in ('@[@"tc", @"setTextColor:"',
+                               '@[@"ac", @"setActiveColor:"',
+                               '@[@"ic", @"setInactiveColor:"',
+                               '@[@"tint", @"setTintColor:"')),
     "还原体(ns) %d 字节 / plan 命中 %d 条" % (
         len(_now_ns),
-        sum(1 for _s in ('@[@"tc"', '@[@"ac"', '@[@"ic"') if _s in _now_ns)))
-chk("S6l 还原只写色不重绘",
-    "setNeedsDisplay" not in _now and "setNeedsLayout" not in _now)
-_slot = body_of("static void SVPNRestoreSlot(id view, NSString *setter", nc)
+        sum(1 for _s in ('@[@"tc"', '@[@"ac"', '@[@"ic"', '@[@"tint"') if _s in _now_ns)))
+# ★★ 2.2-4：S6l 原来是「还原只写色不重绘」—— 这条判据本身是错的，
+#    它正是「断开不褪色」这个 bug 没被拦下的原因。
+#    setActiveColor: 是属性 setter，只存 ivar 不标脏；还原在系统链路
+#    之外执行，后面没有系统重绘来接住它 → 值变了屏幕不变。
+#    方向反转：还原写了色就**必须**标脏重绘。
+#
+# ★ 而且不能只判「函数体里出现过 setNeedsDisplay」——
+#   往它外面套一个 `if (NO) { ... }` 照样命中，判据就成了摆设
+#   （反向验证 B68 抓到过一次）。要判：
+#     · 它必须挂在 didWrite 这个条件里（确实写了色才重绘）
+#     · 还原路径里不许出现恒假守卫
+_reflow_ok = (
+    "if (didWrite) {" in _now
+    and "setNeedsDisplay" in _now
+    and not re.search(r"if \(NO\) \{\s*\n\s*@try", _now)
+)
+chk("S6l ★ 还原写了色必须标脏重绘（属性 setter 不触发绘制）",
+    _reflow_ok,
+    "还原体 %d 字节 / didWrite=%d" % (len(_now), _now.count("if (didWrite) {")))
+_slot = body_of("static BOOL SVPNRestoreSlot(id view, NSString *setter", nc)
+_read = body_of("static UIColor *SVPNReadColor(id view, NSString *getter)", nc)
 chk("S6m 写入口只写实色（非 RGB 不写）",
     "if (![color getRed:&r green:&g blue:&b alpha:&a]) {" in _slot)
 chk("S6n 写入口不写透明色",
     "if (a <= 0.001) {" in _slot)
+# ★ 幂等判断 2.2-4 起挪到「读值」那一侧，锚点跟着走
 chk("S6o 写入口幂等（已相同不写）",
-    "[cur isEqual:color]" in _slot)
+    "if (cur && [cur isEqual:color]) {" in _slot and "return NO;" in _slot)
 chk("S6p IMP 取返回值用 __unsafe_unretained（否则 ARC 误 release）",
-    "__unsafe_unretained id cur = ((id (*)(id, SEL))gimp)(view, gsel);" in _slot)
+    "__unsafe_unretained id cur = ((id (*)(id, SEL))gimp)(view, gsel);" in _read,
+    "读值函数体 %d 字节" % len(_read))
 chk("S6q 每条 slot 还原前判 respondsToSelector",
     "![view respondsToSelector:sel]" in _slot)
+chk("S6q2 读值前也判 respondsToSelector（否则 unrecognized selector）",
+    "![view respondsToSelector:gsel]" in _read,
+    "读值函数体 %d 字节" % len(_read))
 chk("S6r 只在 1→0 时触发还原（连上不擦色）",
     "if (prev == 1 && !now) {" in body_of("static void SVPNNoteTransition(void)", nc))
 
@@ -566,8 +608,32 @@ chk("S11f 没有事后扫描修复机制（坏色应从源头消灭）",
     "残留 %d 处" % (nc.count("SVPNHeal") + nc.count("SVPNMarkSeen") + nc.count("gSVPNSeen")))
 chk("S11g 不做定时轮询（不长期和系统抢同一属性）",
     "DISPATCH_SOURCE_TYPE_TIMER" not in nc and "dispatch_source_create" not in nc)
-chk("S11h 染色路径里不主动重绘（只在系统自己的绘制链路内换色）",
-    "setNeedsDisplay" not in nc and "setNeedsLayout" not in nc)
+# ★★ S11h 原来判「全工程不许出现 setNeedsDisplay / setNeedsLayout」——
+#    这条判据本身是错的，而它正是「断开不褪色」这个 bug 没被拦下的原因：
+#    它把「染色时不要和系统抢绘制节奏」和「还原后必须自己标脏重绘」
+#    当成了同一件事，一刀切全禁。
+#    正确的不变量是**按位置区分**：
+#      · 染色函数体内（applyStyleAttributes: / setXxxColor: / setText:）
+#        不许出现重绘 —— 那时系统正在重画，插队重绘就是抢节奏。
+#      · 还原函数体（SVPNRestoreNow）**必须**出现重绘 —— 那里在系统
+#        链路之外写属性，不标脏就永远不会生效。
+_g17_body = nc[src.index("%group SingleVPN_17"):src.index("%end // SingleVPN_17")]
+_stain_funcs = []
+for _sig in ("- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs",
+             "- (void)setActiveColor:(UIColor *)activeColor",
+             "- (void)setInactiveColor:(UIColor *)inactiveColor",
+             "- (void)setText:(NSString *)text"):
+    for _m in re.finditer(re.escape(_sig), _g17_body):
+        _b = body_of(_sig, _g17_body[_m.start():])
+        if _b:
+            _stain_funcs.append(_b)
+_stain_reflow = [b for b in _stain_funcs if "setNeedsDisplay" in b or "setNeedsLayout" in b]
+chk("S11h 染色函数体内不主动重绘（只在系统自己的绘制链路内换色）",
+    len(_stain_funcs) >= 4 and not _stain_reflow,
+    "染色函数 %d 个，其中含重绘 %d 个" % (len(_stain_funcs), len(_stain_reflow)))
+
+# ★ S11j 已并入 S6l（两条判同一件事会让一条注入点亮两条，
+#   反向用例就没办法精确定位到「是哪一条拦下的」）。
 
 # ⑤ ★★ 绝不凭空造值：系统没给的槽位就别设。
 #    这一条是本轮最重要的一条自律，比「保 alpha」更上位：
@@ -588,6 +654,55 @@ chk("S11i tint / dimmed 只在系统给了值时才设（不拿别的槽位顶�
     and "sysDimmed ?: tintAnchor" not in _wifi_style
     and "sysDimmed ?: sysTint" not in _wifi_style,
     "wifi style 体 %d 字节" % len(_wifi_style))
+
+# ⑥ ★★ 褪色链路：断开后必须真的能把四类槽位都撤回去（2.2-4）。
+#    这是「断开不褪色」之后的回归防线。三个必要条件，缺一条就不褪色：
+#      (a) 还原路径必须覆盖 tint —— 蜂窝/WiFi 图标吃 imageTintColor，
+#          不记账就没有还原入口。
+#      (b) 染色时必须记 tint 这一笔，否则账本里根本没有它。
+#      (c) 还原后必须标脏重绘（已由 S11j 判）。
+#
+# ★★ 这里判的是 @"字面量" 在不在 → **必须**用保留字符串的 ns，
+#    用 nc（strip_code 会把字符串内容抹成空格）会永远 FAIL。
+#    本轮就踩了这个坑：_restore_body 取自 nc，'"tint"' 根本不存在，
+#    于是 S11k/S11l/S11m 三条一起假红。判据方向没错，取错了文本。
+_restore_ns = body_of("static void SVPNRestoreNow(void)", ns)
+_plan_block = ""
+if "NSArray *plan = @[" in _restore_ns:
+    _plan_block = _restore_ns[_restore_ns.index("NSArray *plan = @["):]
+    if "];" in _plan_block:
+        _plan_block = _plan_block[:_plan_block.index("];")]
+chk("S11k 还原路径覆盖 tint 槽位（icon 吃 imageTintColor，没有它就不褪色）",
+    '@"tint"' in _plan_block and "setTintColor:" in _plan_block,
+    "plan 条目 %d 个 / plan 块 %d 字节" % (_plan_block.count('@["'), len(_plan_block)))
+
+# ★ 同理：这条要判 @"tint" 这个字面量，也得用 ns。
+# ★★ 段边界必须用**原文 src** 取下标：`%end // SingleVPN_17` 是注释，
+#    在 ns 里已被抹成空格，直接 index 会 ValueError。
+#    strip_code / strip_comments_only 都是逐字符**等长**替换，
+#    所以 src 上的下标可以直接用来切 ns（这是它们的隐含契约）。
+_a, _b = src.index("%group SingleVPN_17"), src.index("%end // SingleVPN_17")
+_wifi_seg_ns = ns[_a:_b]
+_wifi_seg_ns = _wifi_seg_ns[_wifi_seg_ns.index("%hook STUIStatusBarWifiSignalView"):]
+_wifi_seg_ns = _wifi_seg_ns[:_wifi_seg_ns.index("%end")]
+_wifi_style_ns = body_of("- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs", _wifi_seg_ns)
+chk("S11l 染色时确实记了 tint 这一笔（否则账本里没有它）",
+    'SVPNRecord(self, @"tint"' in _wifi_style_ns,
+    "wifi style 体(ns) %d 字节" % len(_wifi_style_ns))
+
+# ★ tint 槽位不能做「当前值是否仍是我染的」校验：
+#   视图 tintColor 多是继承值，永远不等于 painted → 会恒跳过、永远不还原。
+_tint_pair = [ln for ln in _plan_block.split("\n") if '@"tint"' in ln]
+chk("S11m tint 槽位不做「当前值比对」校验（继承值永不匹配 → 会恒跳过）",
+    bool(_tint_pair) and "@NO" in _tint_pair[0],
+    (_tint_pair[0].strip() if _tint_pair else "找不到 tint 条目"))
+
+# ⑦ ★ 不允许再用「界面外观」当作「要不要还原」的门槛。
+#   这是间接代理指标：桌面状态栏 trait 与 UIApplication 未必一致，
+#   取错了就把整个视图放过去 → 不褪色。撤销永远比保留染色更安全。
+chk("S11n 不用界面外观当还原门槛（间接代理指标，取错就整视图不还原）",
+    "SVPNUserInterfaceStyle" not in nc and "SVPN_STYLE_KEY" not in nc,
+    "残留 %d 处" % (nc.count("SVPNUserInterfaceStyle") + nc.count("SVPN_STYLE_KEY")))
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))

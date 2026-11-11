@@ -274,44 +274,14 @@ static UIColor *svpnReplaceKeepingAlpha(UIColor *original, UIColor *hue) {
 //      账留着就会在下次断开时拿一本跨了多次样式更新的旧账去校准屏幕。
 
 #define SVPN_RESTORE_MAX_VIEWS 32
-#define SVPN_STYLE_KEY @"@style"
 
 static NSMapTable *gSVPNLedger = nil;   // 视图(weak, 指针同一性) → NSMutableDictionary
 static int gSVPNLastDecision = -1;      // -1 未知 / 0 不染 / 1 染
 
-/// 当前界面外观：1 深色 / 0 浅色 / -1 拿不到。
-/// forceRefresh=YES 时绕过缓存 —— 还原是一次性动作，必须拿新鲜值，
-/// 否则「刚切外观就断开」这个窗口会判成「外观没变」而写出过期色。
-/// 染色热路径传 NO：那里每帧都可能走，不能每次都同步问 UIApplication。
-static int SVPNUserInterfaceStyle(BOOL forceRefresh) {
-    static int cached = -2;
-    static CFAbsoluteTime cachedAt = 0;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (!forceRefresh && cached != -2 && (now - cachedAt) < 5.0) {
-        return cached;
-    }
-    int v = -1;
-    @try {
-        UITraitCollection *tc = nil;
-        @try { tc = [UITraitCollection currentTraitCollection]; } @catch (NSException *e) {}
-        if (!tc) {
-            @try {
-                UIApplication *app = [UIApplication sharedApplication];
-                if (app) { tc = [(id)app traitCollection]; }
-            } @catch (NSException *e) {}
-        }
-        if (tc) {
-            v = (tc.userInterfaceStyle == UIUserInterfaceStyleDark) ? 1 : 0;
-        }
-    } @catch (NSException *e) {
-        v = -1;
-    }
-    if (v >= 0) {
-        cached = v;
-        cachedAt = now;
-    }
-    return v;
-}
+// ★ 2.2-4 删掉 SVPNUserInterfaceStyle 与 SVPN_STYLE_KEY。
+//   它们只服务于「按界面外观决定要不要还原」这道门槛，而那道门槛是错的
+//   （见 SVPNRestoreNow 里的说明）。留着一段没人读的记账代码，
+//   后面的人会以为它还起作用 —— 死代码比没代码更危险。
 
 /// ★ key 必须 WeakMemory + ObjectPointerPersonality：
 ///   只写 weakToStrongObjectsMapTable 会退回默认 personality，
@@ -365,56 +335,72 @@ static void SVPNRecord(id view, NSString *slot, UIColor *systemColor, UIColor *p
         if (paintedColor) {
             [d setObject:paintedColor forKey:paintedKey];
         }
-        int style = SVPNUserInterfaceStyle(NO);
-        if (style >= 0) {
-            [d setObject:@(style) forKey:SVPN_STYLE_KEY];
-        }
     } @catch (NSException *e) {
         // 记账失败最多是这次还原不全，绝不影响宿主
     }
 }
 
+/// 读视图某个颜色属性。取不到 / 不是颜色都返回 nil。
+///
+/// ★ ARC 下 IMP 直调返回对象必须 __unsafe_unretained：
+///   ARC 不知道函数指针返回对象的所有权，默认按 +1 处理会误 release
+///   别人的对象 → 崩宿主。
+static UIColor *SVPNReadColor(id view, NSString *getter) {
+    if (!view || !getter) {
+        return nil;
+    }
+    SEL gsel = NSSelectorFromString(getter);
+    if (!gsel || ![view respondsToSelector:gsel]) {
+        return nil;
+    }
+    UIColor *out = nil;
+    @try {
+        IMP gimp = [view methodForSelector:gsel];
+        if (gimp) {
+            __unsafe_unretained id cur = ((id (*)(id, SEL))gimp)(view, gsel);
+            if ([cur isKindOfClass:[UIColor class]]) {
+                out = cur;
+            }
+        }
+    } @catch (NSException *e) {
+        out = nil;
+    }
+    return out;
+}
+
 /// 写一个色回视图的某个槽位。任意一条检查不过就不写。
-static void SVPNRestoreSlot(id view, NSString *setter, NSString *getter, UIColor *color) {
+/// 返回 YES 表示**确实写进去了**（调用方据此决定要不要标脏重绘）。
+static BOOL SVPNRestoreSlot(id view, NSString *setter, NSString *getter, UIColor *color) {
     if (!view || !setter || !color) {
-        return;
+        return NO;
     }
     @try {
         SEL sel = NSSelectorFromString(setter);
         if (!sel || ![view respondsToSelector:sel]) {
-            return;
+            return NO;
         }
         CGFloat r = 0, g = 0, b = 0, a = 0;
         if (![color getRed:&r green:&g blue:&b alpha:&a]) {
-            return;   // 非实色：按当前 trait 重解析可能又变另一个色，不写
+            return NO;   // 非实色：按当前 trait 重解析可能又变另一个色，不写
         }
         if (a <= 0.001) {
-            return;   // 透明色写上去就是看不见
+            return NO;   // 透明色写上去就是看不见
         }
-        // 幂等：已经相同就不写
+        // 幂等：已经相同就不写（也就没有「写过了」这件事）
         if (getter) {
-            SEL gsel = NSSelectorFromString(getter);
-            if (gsel && [view respondsToSelector:gsel]) {
-                @try {
-                    IMP gimp = [view methodForSelector:gsel];
-                    if (gimp) {
-                        // __unsafe_unretained：ARC 不知道函数指针返回对象的所有权，
-                        // 默认按 +1 处理会误 release 别人的对象 → 崩宿主。
-                        __unsafe_unretained id cur = ((id (*)(id, SEL))gimp)(view, gsel);
-                        if ([cur isKindOfClass:[UIColor class]] && [cur isEqual:color]) {
-                            return;
-                        }
-                    }
-                } @catch (NSException *e) {
-                }
+            UIColor *cur = SVPNReadColor(view, getter);
+            if (cur && [cur isEqual:color]) {
+                return NO;
             }
         }
         IMP imp = [view methodForSelector:sel];
         if (imp) {
             ((void (*)(id, SEL, id))imp)(view, sel, color);
+            return YES;
         }
     } @catch (NSException *e) {
     }
+    return NO;
 }
 
 static void SVPNRestoreNow(void) {
@@ -429,7 +415,9 @@ static void SVPNRestoreNow(void) {
         return;
     }
 
-    int styleNow = SVPNUserInterfaceStyle(YES);
+    // ★ 2.2-4 起不再在这里取界面外观：外观比对作为「整视图跳过」的
+    //   门槛已被删除，改成逐槽位判「当前值是否还是我染的那个」。
+    //   见下面循环里的说明。
 
     // 先收集再处理：遍历 NSMapTable 的同时改它属于未定义行为
     NSMutableArray *views = [NSMutableArray array];
@@ -446,13 +434,24 @@ static void SVPNRestoreNow(void) {
         return;
     }
 
-    // 槽位 → setter / getter。只碰这三个：来源明确、有对应视图 setter。
-    // （tint 那一路已删：记账来源是 textColor 但系统原 imageTintColor 未必等于它，
-    //   且 setTintColor: 是 UIView 通用属性会传播到子视图。）
+    // 槽位 → setter / getter / 是否做「当前值是否仍是我染的」校验
+    //
+    // ★★ 2.2-4 把 @"tint" 加回来（2.2-2 曾删掉）。删掉的理由站不住：
+    //    蜂窝/WiFi 图标吃的是 styleAttrs 的 imageTintColor，它没有落成
+    //    某个「可回读」的视图属性，所以不记账就永远没有还原的入口。
+    //    2.1-10 用 setTintColor: 还原这一路，用户当时确认「断开能正常褪色」。
+    //    既然实测过，就照抄，不要用「会传播到子视图」这种推断去否决实测。
+    //
+    // ★ tint 这一路**不能**做「当前值是否仍是我染的」校验，理由：
+    //   styleAttrs.imageTintColor 与 UIView.tintColor 不是同一条通路。
+    //   视图的 tintColor 绝大多数时候是**继承**来的值，从来不会等于
+    //   我们记下的 painted → 若套用同一判据，每次都会被判成「系统已改过」
+    //   然后跳过，等于这一路永远不还原（比不记账还差，因为它看起来在做事）。
     NSArray *plan = @[
-        @[@"tc", @"setTextColor:", @"textColor"],
-        @[@"ac", @"setActiveColor:", @"activeColor"],
-        @[@"ic", @"setInactiveColor:", @"inactiveColor"],
+        @[@"tc", @"setTextColor:", @"textColor", @YES],
+        @[@"ac", @"setActiveColor:", @"activeColor", @YES],
+        @[@"ic", @"setInactiveColor:", @"inactiveColor", @YES],
+        @[@"tint", @"setTintColor:", @"tintColor", @NO],
     ];
 
     for (id view in views) {
@@ -460,32 +459,75 @@ static void SVPNRestoreNow(void) {
         if (!d) {
             continue;
         }
-        // ② 逐视图外观比对：过期就跳过这个视图（不清表）
-        BOOL usable = YES;
-        @try {
-            NSNumber *rec = [d objectForKey:SVPN_STYLE_KEY];
-            if (styleNow >= 0 && rec && [rec intValue] != styleNow) {
-                usable = NO;
+
+        // ★★ 2.2-4 删掉「外观比对就整视图跳过」这道门槛。
+        //
+        //    2.2-2/2.2-3 判的是：记账时的 userInterfaceStyle ≠ 还原时的 → 跳过。
+        //    这是拿一个**间接代理指标**去推断「这批色还在不在」，而它错在两处：
+        //      · 桌面状态栏的 trait 与 UIApplication 的 trait 未必一致，
+        //        取哪一个是运气；取到不一致的值就把整个视图放过去了。
+        //      · 即使外观真的变了，正确的动作也不是「留着绿色」，而是
+        //        「先把绿色撤掉」—— 撤销永远比保留我们的染色更安全。
+        //
+        //    改成直接判据：**当前值还是不是我染的那个色？**
+        //      · 还是 → 系统没动过，必须还原。
+        //      · 已被系统改掉 → 系统自己刷新了，不用管，跳过。
+        //    这才是「还原」这个词真正想问的问题。
+
+        BOOL didWrite = NO;
+        for (NSArray *pair in plan) {
+            NSString *slot = pair[0];
+            NSString *setter = pair[1];
+            NSString *getter = pair[2];
+            BOOL checkCurrent = [pair[3] boolValue];
+
+            UIColor *origin = nil;
+            UIColor *painted = nil;
+            @try {
+                origin = [d objectForKey:slot];
+                painted = [d objectForKey:[slot stringByAppendingString:@"#"]];
+            } @catch (NSException *e) {
+                origin = nil;
             }
-        } @catch (NSException *e) {
-            usable = NO;
-        }
-        if (usable) {
-            for (NSArray *pair in plan) {
-                UIColor *c = nil;
-                @try {
-                    c = [d objectForKey:pair[0]];
-                } @catch (NSException *e) {
-                    c = nil;
-                }
-                if (c) {
-                    SVPNRestoreSlot(view, pair[1], pair[2], c);
+            if (!origin) {
+                continue;
+            }
+
+            // 系统已经自己改过这一路 → 不需要我们动手
+            if (checkCurrent && painted) {
+                UIColor *cur = SVPNReadColor(view, getter);
+                if (cur && ![cur isEqual:painted]) {
+                    continue;
                 }
             }
+
+            if (SVPNRestoreSlot(view, setter, checkCurrent ? getter : nil, origin)) {
+                didWrite = YES;
+            }
         }
-        // ④ 销账。原色表必销（账本不跨周期）；
-        //    「我染的色」只在真还原时销 —— 外观不符跳过时若把它销掉，
-        //    下一轮残留识别就失效，会把绿色当系统色存下来。
+
+        // ★★ 2.2-4 还原后必须自己标脏重绘。
+        //
+        //    为什么这条不能省（2.2-2 删掉它就是「断开不褪色」的直接原因）：
+        //      setActiveColor: / setInactiveColor: 是**属性 setter**，
+        //      只把值存进 ivar，不碰 CALayer、不标脏、不触发绘制。
+        //      系统之所以会重画，是因为这些 setter 平时都在系统自己的
+        //      「数据更新 → 布局 → 绘制」链路里被调用 —— 一次调用后面
+        //      紧跟着系统自己的重绘。
+        //      而还原发生在**系统链路之外**（断开后的主队列下一拍），
+        //      后面没有任何一次系统重绘来接住它 → 值变了，屏幕不变。
+        //
+        //    ★ 这条与「染色时不额外重绘」不矛盾，那是两件事：
+        //      · 染色：系统正在重画，我们插队重绘 = 和系统抢节奏 → 禁止。
+        //      · 还原：系统不会重画，我们自己不标脏 = 永远不会生效 → 必须。
+        if (didWrite) {
+            @try {
+                [view setNeedsDisplay];
+            } @catch (NSException *e) {
+            }
+        }
+
+        // ④ 销账。原色表必销（账本不跨周期）。
         @try {
             [gSVPNLedger removeObjectForKey:view];
         } @catch (NSException *e) {
@@ -504,8 +546,11 @@ static void SVPNRestoreNow(void) {
 //     启发式一定会有误判：系统在某些场景下（未激活格、淡出动画、按压态）
 //     本来就给低 alpha，"低 alpha = 坏" 这个前提并不成立。
 //   · 它在系统的更新流程之外写视图属性（setNeedsDisplay / setXxxColor）。
-//     而「在系统流程外改状态栏私有视图」正是原版那个 bug 的同一类动作 ——
-//     系统不会知道我们改过，也不会纠正，只会越改越偏。
+//     ★ 注意：这里说的「坏事」是**在系统正绘制的时候插队重画**，
+//       不是「永远不能在系统之外写属性」。2.2-4 修的正是后者被误用的后果：
+//       还原本来就必须在系统链路之外做（断开时系统不会重画），
+//       那时**必须**自己标脏，否则值改了屏幕不变。
+//       两句话的区别就是「染色路径」与「还原路径」，闸门 S11h / S6l 分开判。
 //   · 定时器 2 秒扫一轮，等于让插件长期和系统抢同一个属性。
 //
 // 根本修法是把「坏色」这类值从**源头**消灭，而不是事后认出来：
@@ -516,7 +561,7 @@ static void SVPNRestoreNow(void) {
 //        · svpnReplaceKeepingAlpha → alpha 来自**系统原色**的 sa
 //      没有任何一条路径的 alpha 来自我们自己，想压也压不下去。
 //   ③ 染色只发生在系统自己的调用栈里（applyStyleAttributes: / setXxxColor:），
-//      也就是系统「本来就在重画」的时刻。系统流程之外不写任何视图属性。
+//      也就是系统「本来就在重画」的时刻 —— 染色路径里不插队重绘。
 //
 // 结果：图标看不见这件事**没有发生的机会**，而不是「发生了再修」。
 //
@@ -525,6 +570,12 @@ static void SVPNRestoreNow(void) {
 //   _updateWithData: / _updateWithAggregatedData: 被调用 → %orig 触发
 //   完整重绘 → applyStyleAttributes: 重新下发样式 → 我们在这条链路里
 //   按系统的 alpha 换色相。这条链路是系统自己的，不靠我们另外补一次重绘。
+//
+// ★★ 但「断开要褪色」是**另一条路**，它必须自己补动作：
+//    断开时系统只是把 vpnEntry.enabled 变 NO，不改变格数/强度/文字，
+//    因此不会重发样式 → 染色 hook 不再被调用 → 上一轮的绿色留在视图上。
+//    所以断开会走 SVPNRestoreNow 主动写回原色，并且**必须自己标脏重绘**
+//    （2.2-2 把这条删了，直接导致「断开不褪色」）。
 
 static void SVPNRestoreAsync(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -702,10 +753,12 @@ static void SVPNNoteTransition(void) {
             UIColor *hue = svpnReplacementFor(sysText ?: sysTint);
             if (hue) {
                 STUIStatusBarStyleAttributes *copy = nil;
+                // 提到块外：记账要用（下面 if (sysTint) 块内才算得出来）
+                UIColor *tint = nil;
 
                 if (sysTint) {
                     // alpha 来自 sysTint 自己 —— 不借用别的槽位的 alpha
-                    UIColor *tint = svpnReplaceKeepingAlpha(sysTint, hue);
+                    tint = svpnReplaceKeepingAlpha(sysTint, hue);
                     if (tint) {
                         copy = copy ?: [styleAttrs copy];
                         [copy setImageTintColor:tint];
@@ -724,10 +777,18 @@ static void SVPNNoteTransition(void) {
 
                 if (copy) {
                     styleAttrs = copy;
-                    // 这一路不记账：styleAttrs 是临时对象，改它只影响本次绘制。
-                    // 要还原得落到具体视图上，而视图侧没有与 imageTintColor 对应的
-                    // 安全 setter（setTintColor: 会传播到子视图）。
-                    // 这一路的色本来就会在下一次样式下发时被自然覆盖。
+
+                    // ★★ 2.2-4 补回 tint 记账（2.2-2 曾以「会传播到子视图」
+                    //    为由删掉，但那是推断，而 2.1-10 用同一个 setter
+                    //    还原过、并且你实测确认「断开能正常褪色」）。
+                    //
+                    //    记的是**系统的** imageTintColor（sysTint），
+                    //    还原时按 setTintColor: 写回视图。
+                    //    没有这一笔，蜂窝/WiFi 图标就永远没有还原入口 ——
+                    //    这正是「断开不褪色」的第三处缺口。
+                    if (sysTint && tint) {
+                        SVPNRecord(self, @"tint", sysTint, tint);
+                    }
                 }
             }
         } @catch (NSException *e) {

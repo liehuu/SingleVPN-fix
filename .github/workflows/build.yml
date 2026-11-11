@@ -9,7 +9,7 @@ on:
       - release
 
 env:
-  VERSION: 2.2-3
+  VERSION: 2.2-4
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
@@ -34,11 +34,11 @@ jobs:
 
           cnt() { printf '%s' "$1" | grep -Fc -- "$2" || true; }
 
-          echo "--- 0. 确认推上来的是 2.2-3（根本修复版），不是旧文件 ---"
+          echo "--- 0. 确认推上来的是 2.2-4（根本修复版），不是旧文件 ---"
           for old in gSVPNOriginals SVPNRememberOriginal SVPNRestorePaintedViewsNow \
                      gSVPNPainted kSVPNStyleKey SVPN_DIAG SVPN_DISABLE_ENTRY_MERGE; do
             if printf '%s' "$CODE" | grep -q -- "$old"; then
-              echo "✗ 源码里还有旧结构 $old —— 推的不是 2.2-3"; exit 1
+              echo "✗ 源码里还有旧结构 $old —— 推的不是 2.2-4"; exit 1
             fi
           done
           echo "  ✓ 旧结构已清空"
@@ -96,10 +96,36 @@ jobs:
           if printf '%s' "$CODE" | grep -q 'DISPATCH_SOURCE_TYPE_TIMER'; then
             echo "✗ 又加回定时轮询（长期和系统抢同一属性）"; exit 1
           fi
-          if printf '%s' "$CODE" | grep -Eq 'setNeedsDisplay|setNeedsLayout'; then
-            echo "✗ 染色路径里又主动重绘了（会和系统绘制节奏打架）"; exit 1
+          # ★★ 2.2-4：这里原来判「全工程不许出现 setNeedsDisplay」。
+          #    那条判据本身是错的，而且正是「断开不褪色」没被 CI 拦下的原因：
+          #    它把「染色时别和系统抢绘制节奏」和「还原后必须自己标脏」
+          #    当成同一件事，一刀切全禁 → 还原写了色却不重绘，屏幕不更新。
+          #    改成按位置区分：
+          #      · 染色函数体内不许重绘（系统正在重画，插队就是抢节奏）
+          #      · 还原函数体必须重绘（系统链路之外写属性，不标脏永不生效）
+          # ★ 不能只判「函数体里出现过 setNeedsDisplay」——把它包进
+          #   `if (NO) { ... }` 里照样命中，判据就成了摆设（反向验证抓到过）。
+          #   要判的是「它挂在 didWrite 这个条件下、且没有被改成恒假」。
+          REST=$(sed -n '/^static void SVPNRestoreNow(void)/,/^}/p' "$SRC")
+          echo "$REST" | grep -q 'if (didWrite) {' \
+            || { echo "✗ 还原重绘不在「确实写了色」的条件里"; exit 1; }
+          echo "$REST" | grep -q 'setNeedsDisplay' \
+            || { echo "✗ 还原写了色却不标脏重绘 —— 属性 setter 不触发绘制，屏幕不会更新"; exit 1; }
+          if echo "$REST" | grep -Eq 'if \(NO\) \{[[:space:]]*$'; then
+            echo "✗ 还原路径里出现 if (NO) 恒假守卫（判据被架空的典型手法）"; exit 1
           fi
-          # ③ 色相绝不直接进 UI 槽位：所有染色点必须再包一层保 alpha。
+          # 染色函数体（只取 %group SingleVPN_17 里那四个染色入口）
+          for sig in 'applyStyleAttributes:(STUIStatusBarStyleAttributes' \
+                     'setActiveColor:(UIColor' 'setInactiveColor:(UIColor' \
+                     'setText:(NSString'; do
+            if printf '%s' "$CODE" | awk -v s="$sig" '
+                  index($0,"- (void)" s) {inb=1; d=0}
+                  inb { d += gsub(/\{/,"{"); d -= gsub(/\}/,"}"); print; if (d==0 && NR>1) inb=0 }
+                ' | grep -q 'setNeedsDisplay'; then
+              echo "✗ 染色函数体里主动重绘（$sig）—— 系统正在重画，会抢节奏"; exit 1
+            fi
+          done
+          # ② 色相绝不直接进 UI 槽位：所有染色点必须再包一层保 alpha。
           test "$(cnt "$CODE" 'svpnReplaceKeepingAlpha(')" -ge 5 \
             || { echo "✗ 有染色点绕过保 alpha 包装"; exit 1; }
           # ④ ★★ 绝不凭空造值：系统没给的槽位就别设。
@@ -118,10 +144,32 @@ jobs:
             || { echo "✗ 还原账本缺失"; exit 1; }
           test "$(cnt "$CODE" '[gSVPNLedger removeObjectForKey:view];')" -eq 1 \
             || { echo "✗ 还原后没销账（账本会跨周期复用）"; exit 1; }
-          test "$(cnt "$SRC" '@"tint"')" -eq 0 \
-            || { echo "✗ tint 槽位没清（setTintColor: 会传播到子视图）"; exit 1; }
+          # ★★ 2.2-4 方向反转：tint 槽位**必须**在还原计划里。
+          #    原来这里判「tint 必须 0 处」（理由是 setTintColor: 会传播），
+          #    但 2.1-10 用同一个 setter 还原过、并有用户实测背书；
+          #    删掉它等于蜂窝/WiFi 图标永远没有还原入口 → 断开不褪色。
+          # ★ $SRC 是**文件名**不是内容，必须用 grep <pat> "$SRC"
+          #   （曾经误写成 printf '%s' "$SRC" | grep → 永远搜不到 → 永不失败）
+          grep -q '@\[@"tint", @"setTintColor:", @"tintColor"' "$SRC" \
+            || { echo "✗ 还原计划里没有 tint —— 蜂窝/WiFi 图标断开后不会褪色"; exit 1; }
+          # tint 不能做「当前值校验」：视图 tintColor 多是继承值，永不匹配
+          if grep -q '@\[@"tint", @"setTintColor:", @"tintColor", @YES\]' "$SRC"; then
+            echo "✗ tint 做了当前值校验 —— 继承值永不匹配，会恒跳过"; exit 1
+          fi
+          # ★ 用 grep -c 数行数，不用 cnt：cnt 是 grep -F（固定字符串），
+          #   写 \[ 转义会被当成字面反斜杠 → 永远 0 命中 → 判据永远通过。
+          N=$(grep -c 'setTintColor:"' "$SRC" || true)
+          test "$N" -eq 1 \
+            || { echo "✗ tint 槽位不唯一（命中 $N 次）"; exit 1; }
           test "$(cnt "$CODE" 'if (prev == 1 && !now) {')" -eq 1 \
             || { echo "✗ 还原触发条件不是 1→0"; exit 1; }
+          # ★ 染色时必须记 tint 这一笔，否则账本里没有它
+          grep -q 'SVPNRecord(self, @"tint"' "$SRC" \
+            || { echo "✗ 染色时没记 tint —— 账本里没有它，无从还原"; exit 1; }
+          # ★ 不许再用界面外观当还原门槛（间接代理指标，取错就整视图不还原）
+          if printf '%s' "$CODE" | grep -Eq 'SVPNUserInterfaceStyle|SVPN_STYLE_KEY'; then
+            echo "✗ 又用界面外观决定要不要还原 —— 取错一个 trait 就整视图不褪色"; exit 1
+          fi
 
           echo "--- 7. 写入口三条硬约束 ---"
           grep -q 'getRed:&r green:&g blue:&b alpha:&a' "$SRC" \
@@ -138,7 +186,7 @@ jobs:
           grep -q 'format=tarfile.GNU_FORMAT' devkit/mkdeb.sh \
             || { echo "✗ tar 没指定 GNU_FORMAT（PAX 头会让 dpkg 装不上）"; exit 1; }
 
-          echo "✓ 补丁在位（2.2-3）"
+          echo "✓ 补丁在位（2.2-4）"
 
       - name: Source self-check (single source of truth)
         run: |

@@ -197,10 +197,13 @@ CASES = [
                 "        if (lastPainted && [lastPainted isEqual:systemColor]) {",
                 "        if (NO) {",
                 "S6c 残留识别"),
-    one_replace("B25 记账不存外观（跨外观写回 = 错色）",
-                "            [d setObject:@(style) forKey:SVPN_STYLE_KEY];",
-                "            (void)style;",
-                "S6d 记账时把外观存进该视图自己的字典"),
+    # ★★ 2.2-4：B25/B29/B30/B31 原来测的是「按外观记账 + 比对外观」，
+    #    那套机制已删除（它是「断开不褪色」的根因）。用例整体改写。
+    one_replace("B25 ★ 把「按界面外观记账」加回来（间接代理指标，取错就整视图不还原）",
+                "        [d setObject:systemColor forKey:slot];",
+                "        [d setObject:@(0) forKey:SVPN_STYLE_KEY];\n"
+                "        [d setObject:systemColor forKey:slot];",
+                "S6d 不再按界面外观记账"),
     one_replace("B26 还原前不复核当前状态（断开又秒连会擦掉新染的色）",
                 "    // 延后执行期间可能已经重新连上，此时擦色就是新 bug\n"
                 "    if (SVPNDecision()) {\n        return;\n    }\n",
@@ -215,58 +218,74 @@ CASES = [
                 "        for (id v in gSVPNLedger) {\n"
                 "            [gSVPNLedger removeObjectForKey:v];\n            if (v) {",
                 "S6g 先收集再处理"),
-    one_replace("B29 去掉逐视图外观比对（跨外观写回 = 图标空白）",
-                "            if (styleNow >= 0 && rec && [rec intValue] != styleNow) {",
-                "            if (NO) {",
-                "S6h 逐视图外观比对"),
-    one_replace("B30 外观不符时清空整表（外观没变的记录一起丢）",
-                "            if (styleNow >= 0 && rec && [rec intValue] != styleNow) {\n"
-                "                usable = NO;\n            }",
-                "            if (styleNow >= 0 && rec && [rec intValue] != styleNow) {\n"
-                "                [gSVPNLedger removeAllObjects];\n                usable = NO;\n            }",
-                "S6h 逐视图外观比对"),
-    one_replace("B31 还原侧用缓存外观（刚切外观就断开会判错）",
-                "    int styleNow = SVPNUserInterfaceStyle(YES);",
-                "    int styleNow = SVPNUserInterfaceStyle(NO);",
-                "S6i 还原侧绕过缓存拿新鲜外观"),
+    # ★★ B29/B30 直接对应「断开不褪色」这个 bug 的两个成因。
+    one_replace("B29 ★★ 还原改回「按外观不符就整视图跳过」（= 断开不褪色的原 bug）",
+                "        BOOL didWrite = NO;",
+                "        int styleNow = SVPNUserInterfaceStyle(YES);\n"
+                "        NSNumber *rec = [d objectForKey:SVPN_STYLE_KEY];\n"
+                "        if (styleNow >= 0 && rec && [rec intValue] != styleNow) {\n"
+                "            continue;\n"
+                "        }\n"
+                "        BOOL didWrite = NO;",
+                "S6h ★ 不用外观比对当还原门槛"),
+    one_replace("B30 ★ 去掉「当前值是否仍是我染的」判断（会把系统已刷新的也重写）",
+                "            if (checkCurrent && painted) {\n"
+                "                UIColor *cur = SVPNReadColor(view, getter);\n"
+                "                if (cur && ![cur isEqual:painted]) {\n"
+                "                    continue;\n"
+                "                }\n"
+                "            }",
+                "            (void)checkCurrent;",
+                "S6i ★ 逐槽位判「当前值是否仍是我染的」"),
     one_replace("B32 处理完不销账（旧账跨周期复用 → 不定期写错色）",
                 "            [gSVPNLedger removeObjectForKey:view];\n",
                 "",
                 "S6j 处理完销账"),
-    one_replace("B33 还原计划把 tint 加回来（setTintColor: 会传播到子视图）",
-                '        @[@"ic", @"setInactiveColor:", @"inactiveColor"],\n    ];',
-                '        @[@"ic", @"setInactiveColor:", @"inactiveColor"],\n'
-                '        @[@"tint", @"setTintColor:", @"tintColor"],\n    ];',
-                "S6k 只碰 tc/ac/ic 三个槽位"),
-    one_replace("B34 少一个安全槽位（该图标断开后还原不回来）",
-                '        @[@"ac", @"setActiveColor:", @"activeColor"],\n',
+    # ★★ B33 方向反转：原来是「把 tint 加回来 = 违规」，
+    #    现在是「把 tint 去掉 = 违规」（去掉就不褪色）。
+    one_replace("B33 ★★ 还原计划删掉 tint（蜂窝/WiFi 图标就永远不褪色）",
+                '        @[@"tint", @"setTintColor:", @"tintColor", @NO],\n',
                 "",
-                "S6k 只碰 tc/ac/ic 三个槽位"),
-    one_replace("B35 还原路径加回强制重绘（白重绘，且会碰宿主观测）",
-                "        for (NSArray *pair in plan) {",
-                "        [view setNeedsDisplay];\n        for (NSArray *pair in plan) {",
-                "S6l 还原只写色不重绘"),
+                "S6k ★ 还原覆盖 tc/ac/ic/tint 四路"),
+    one_replace("B34 少一个安全槽位（该图标断开后还原不回来）",
+                '        @[@"ac", @"setActiveColor:", @"activeColor", @YES],\n',
+                "",
+                "S6k ★ 还原覆盖 tc/ac/ic/tint 四路"),
+    # ★★ B35 方向反转：原来是「加回强制重绘 = 违规」，
+    #    现在是「去掉还原重绘 = 违规」（属性 setter 不触发绘制 → 不褪色）。
+    one_replace("B35 ★★ 去掉还原后的标脏重绘（= 断开不褪色的直接原因）",
+                "        if (didWrite) {\n            @try {\n                [view setNeedsDisplay];",
+                "        if (NO) {\n            @try {\n                [view setNeedsDisplay];",
+                "S6l ★ 还原写了色必须标脏重绘"),
     one_replace("B36 去掉实色检查（动态色会按当前 trait 重解析成错色）",
-                "        if (![color getRed:&r green:&g blue:&b alpha:&a]) {\n            return;",
-                "        r = g = b = a = 1;\n        if (NO) {\n            return;",
+                "        if (![color getRed:&r green:&g blue:&b alpha:&a]) {\n            return NO;",
+                "        r = g = b = a = 1;\n        if (NO) {\n            return NO;",
                 "S6m 写入口只写实色"),
     one_replace("B37 去掉透明色检查（写透明 = 图标空白）",
-                "        if (a <= 0.001) {",
-                "        if (NO) {",
+                "        if (a <= 0.001) {\n            return NO;",
+                "        if (NO) {\n            return NO;",
                 "S6n 写入口不写透明色"),
     one_replace("B38 去掉幂等检查（在系统更新流程之外反复改私有属性）",
-                "                        if ([cur isKindOfClass:[UIColor class]] && [cur isEqual:color]) {\n"
-                "                            return;\n                        }",
-                "                        (void)cur;",
+                "        if (getter) {\n"
+                "            UIColor *cur = SVPNReadColor(view, getter);\n"
+                "            if (cur && [cur isEqual:color]) {\n"
+                "                return NO;\n"
+                "            }\n"
+                "        }",
+                "        (void)getter;",
                 "S6o 写入口幂等"),
     one_replace("B39 IMP 取返回值不用 __unsafe_unretained（ARC 误 release → 崩宿主）",
                 "__unsafe_unretained id cur = ((id (*)(id, SEL))gimp)(view, gsel);",
                 "id cur = ((id (*)(id, SEL))gimp)(view, gsel);",
                 "S6p IMP 取返回值用 __unsafe_unretained"),
     one_replace("B40 写入口不判 respondsToSelector（unrecognized selector 崩宿主）",
-                "        if (!sel || ![view respondsToSelector:sel]) {",
-                "        if (!sel) {",
+                "        if (!sel || ![view respondsToSelector:sel]) {\n            return NO;\n        }",
+                "        if (!sel) {\n            return NO;\n        }",
                 "S6q 每条 slot 还原前判 respondsToSelector"),
+    one_replace("B40b 读值不判 respondsToSelector（unrecognized selector 崩宿主）",
+                "    if (!gsel || ![view respondsToSelector:gsel]) {\n        return nil;\n    }",
+                "    if (!gsel) {\n        return nil;\n    }",
+                "S6q2 读值前也判 respondsToSelector"),
     one_replace("B41 过渡条件写成「变了就擦」（连上时也擦色）",
                 "    if (prev == 1 && !now) {",
                 "    if (prev != (now ? 1 : 0)) {",
@@ -288,9 +307,9 @@ CASES = [
                 "__unsafe_unretained id cur = ((id (*)(id, SEL))objc_msgSend)(view, gsel);",
                 "S7e 不用裸 objc_msgSend"),
     one_replace("B45 主动触发宿主状态栏重绘（最危险的一类改动）",
-                "    int styleNow = SVPNUserInterfaceStyle(YES);",
-                "    int styleNow = SVPNUserInterfaceStyle(YES);\n"
-                "    [[UIApplication sharedApplication] setNeedsStatusBarAppearanceUpdate];",
+                "    // 先收集再处理：遍历 NSMapTable 的同时改它属于未定义行为",
+                "    [[UIApplication sharedApplication] setNeedsStatusBarAppearanceUpdate];\n"
+                "    // 先收集再处理：遍历 NSMapTable 的同时改它属于未定义行为",
                 "S7f 不主动触发宿主状态栏重绘"),
     one_replace("B46 代码里混入 killall（装包/运行红线）",
                 "static void SVPNRestoreAsync(void) {",
@@ -408,13 +427,58 @@ CASES = [
                 "                [self setNeedsDisplay];\n"
                 "                SVPNRecord(self, @\"ac\", activeColor, paint);\n"
                 "                activeColor = paint;\n            }",
-                "S11h 染色路径里不主动重绘"),
+                "S11h 染色函数体内不主动重绘"),
+
+    # ---------------------------------------------------------------
+    # S11j~S11n 褪色链路（2.2-4）
+    # ★★ 这一组的每一例都直接对应「断开不褪色」的一个真实成因。
+    #    它们必须能失败 —— 否则下次同样的回归还是拦不住。
+    # ---------------------------------------------------------------
+    # ★ 两种注入都要拦：① 整块删掉；② 套进 if (NO) ——
+    #   只判「出现过 setNeedsDisplay」的话，② 会漏（反向验证抓到过）。
+    one_replace("B68 ★★ 去掉还原后的标脏重绘（= 断开不褪色的直接原因）",
+                "        if (didWrite) {\n"
+                "            @try {\n"
+                "                [view setNeedsDisplay];",
+                "        if (NO) {\n"
+                "            @try {\n"
+                "                [view setNeedsDisplay];",
+                "S6l ★ 还原写了色必须标脏重绘"),
+    one_replace("B68b ★ 把还原重绘整块删掉（连 if (NO) 都不留）",
+                "        if (didWrite) {\n"
+                "            @try {\n"
+                "                [view setNeedsDisplay];\n"
+                "            } @catch (NSException *e) {\n"
+                "            }\n"
+                "        }",
+                "        (void)didWrite;",
+                "S6l ★ 还原写了色必须标脏重绘"),
+    one_replace("B69 ★★ 还原计划漏掉 tint（icon 永远不褪色）",
+                '        @[@"tint", @"setTintColor:", @"tintColor", @NO],\n',
+                "",
+                "S11k 还原路径覆盖 tint 槽位"),
+    one_replace("B70 ★★ 染色时不记 tint（账本里没它 → 无从还原）",
+                "                    if (sysTint && tint) {\n"
+                "                        SVPNRecord(self, @\"tint\", sysTint, tint);\n"
+                "                    }",
+                "                    (void)tint;",
+                "S11l 染色时确实记了 tint 这一笔"),
+    one_replace("B71 ★ tint 槽位改成做「当前值校验」（继承值永不匹配 → 恒跳过）",
+                '@[@"tint", @"setTintColor:", @"tintColor", @NO],',
+                '@[@"tint", @"setTintColor:", @"tintColor", @YES],',
+                "S11m tint 槽位不做「当前值比对」校验"),
+    one_replace("B72 ★★ 把「按界面外观决定要不要还原」加回来（= 断开不褪色的原 bug）",
+                "    // 先收集再处理：遍历 NSMapTable 的同时改它属于未定义行为",
+                "    int styleNow = SVPNUserInterfaceStyle(YES);\n"
+                "    (void)styleNow;\n"
+                "    // 先收集再处理：遍历 NSMapTable 的同时改它属于未定义行为",
+                "S11n 不用界面外观当还原门槛"),
 
     # ---------------------------------------------------------------
     # S9 版本号一致性
     # ---------------------------------------------------------------
-    one_replace("B57 版本号三处不一致（装着 2.2-3，报 2.1-11）",
-                "SingleVPN 2.2-3 已安装",
+    one_replace("B57 版本号三处不一致（装着 2.2-4，报 2.1-11）",
+                "SingleVPN 2.2-4 已安装",
                 "SingleVPN 2.1-11 已安装",
                 "S9a 三处版本号一致", file="mk"),
 ]
