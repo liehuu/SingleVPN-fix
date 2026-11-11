@@ -1001,6 +1001,37 @@ chk("S13c 源码有 SVPN_DIAG_ 前缀常量但没有裸 SVPN_DIAG（判据两侧
     _diag_prefixed >= 2 and _bare_diag == 0,
     "带前缀 %d 个 / 裸的 %d 个" % (_diag_prefixed, _bare_diag))
 
+# ④ ★★ 静态函数「先声明/定义、后使用」——C 的硬要求，违反就是编译错误。
+#    这条是 2.2-5 真实踩到的：SVPNPrefsChanged 在 405 行调用 ReloadPrefs，
+#    而 ReloadPrefs 定义在 428 行 → CI 报
+#      error: use of undeclared identifier 'ReloadPrefs'
+#    本机没有 Xcode，这类错误只能等 CI，一次失败一次往返。
+#    所以在这里按**通用规则**判，不只判这一个符号：
+#    对每个 `static ... name(` 形式的函数，若它的首次「调用」早于
+#    「定义或前置声明」，就报出来。
+_static_defs = {}
+for _m in re.finditer(r"^static\s+(?:inline\s+)?[\w\s\*]+?\b([A-Za-z_]\w*)\s*\(", nc, re.M):
+    _fn = _m.group(1)
+    _static_defs.setdefault(_fn, _m.start())
+# 前置声明形如 `static void Foo(void);`（花括号前就结束）
+_forwards = {}
+for _m in re.finditer(r"^static\s+(?:inline\s+)?[\w\s\*]+?\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*;",
+                      nc, re.M):
+    _forwards.setdefault(_m.group(1), _m.start())
+_order_viol = []
+for _fn, _def_at in _static_defs.items():
+    _avail = min([p for p in (_def_at, _forwards.get(_fn)) if p is not None])
+    # 找第一次「调用」：函数名后面跟 ( 但该位置不是定义/声明处
+    for _c in re.finditer(r"\b%s\s*\(" % re.escape(_fn), nc):
+        if _c.start() == _def_at or _c.start() == _forwards.get(_fn):
+            continue
+        if _c.start() < _avail:
+            # 排除它自己的定义/声明参数表内部的匹配
+            _order_viol.append("%s 在 %d 处先用、%d 处才可见" % (_fn, _c.start(), _avail))
+            break
+chk("S13d 静态函数都是先声明/定义后使用（否则 CI 报 undeclared identifier）",
+    not _order_viol, "违规 %s" % _order_viol)
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:

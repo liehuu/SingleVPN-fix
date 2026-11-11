@@ -640,6 +640,15 @@ CASES = [
                 "#define SVPN_DIAG 0\n#define SVPN_DIAG_SLOTS 256",
                 "S13c 源码有 SVPN_DIAG_ 前缀常量但没有裸 SVPN_DIAG"),
 
+    # ★★ 2.2-5 真实踩到的编译错（CI 第 2 次假红，这次是真编不过）：
+    #    SVPNPrefsChanged 在 405 行调用 ReloadPrefs，而它定义在 428 行
+    #    → error: use of undeclared identifier 'ReloadPrefs'
+    #    本机没有 Xcode，这类错只能等 CI，一次失败一次往返。
+    one_replace("B100 去掉 ReloadPrefs 前置声明（CI 报 undeclared identifier）",
+                "static void ReloadPrefs(void);\n",
+                "",
+                "S13d 静态函数都是先声明/定义后使用"),
+
     # ---------------------------------------------------------------
     # S9 版本号一致性
     # ---------------------------------------------------------------

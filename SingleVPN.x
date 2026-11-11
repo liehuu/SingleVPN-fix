@@ -211,6 +211,10 @@ static UIColor *_lightReplacementColor = nil;  // 系统色偏浅时用
 
 // 前置声明：SVPNNote 要读当前判定结果，而 SVPNDecision 定义在后面。
 static inline BOOL SVPNDecision(void);
+// ★ ReloadPrefs 定义在文件中部（约 428 行），而下面的通知回调
+//   SVPNPrefsChanged 在 405 行就调用它 —— 必须前置声明，否则
+//   `use of undeclared identifier 'ReloadPrefs'`（CI 上真的报了这条）。
+static void ReloadPrefs(void);
 
 // 事件类型（整数，编译期常量）
 enum {
