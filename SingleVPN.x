@@ -678,9 +678,22 @@ static void SVPNNoteTransition(void) {
 - (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs {
     if (SVPNDecision() && styleAttrs) {
         @try {
-            // 两个槽位各换各的：**alpha 一律沿用该槽位自己那份系统色**。
-            // ★ 不要拿 textColor 的 alpha 去染 imageTintColor 槽 ——
-            //   它们是两份独立的系统值，混用会在淡出/次要元素时算出错的透明度。
+            // ★★ 一条不可讨价还价的规则：**只替换系统已经给了的值，
+            //    绝不凭空添加系统没给的值。**
+            //
+            //    为什么这条是本版最关键的自律：
+            //      状态栏这套私有绘制管线里，某个槽位是 nil 是有语义的 ——
+            //      「这一路不参与绘制」/「沿用上一份」。我们若在系统没给的
+            //      情况下塞一个自己造的色进去，等于替系统决定了一件它没打算
+            //      决定的事。原版那两个 bug（回填空壳 entry、写死 alpha 0.2）
+            //      本质都是这一类：在系统没要求的地方替它做决定。
+            //
+            //    具体到这段：
+            //      · imageTintColor 为 nil  → 不设 tint（别拿 textColor 顶替）
+            //      · imageDimmedTintColor 为 nil → 不设 dimmed
+            //        （别拿 tint 顶替！那会让「本该淡的次要元素」变得和
+            //         正常元素一样亮，是反方向的错误。）
+            //      · 两个 tint 都只做一件事：RGB 换成配置色，alpha 原封不动。
             UIColor *sysText = styleAttrs.textColor;
             UIColor *sysTint = styleAttrs.imageTintColor;
             UIColor *sysDimmed = styleAttrs.imageDimmedTintColor;
@@ -688,29 +701,34 @@ static void SVPNNoteTransition(void) {
             // 色相只决定 RGB，来源优先级：文字色 > 图片 tint
             UIColor *hue = svpnReplacementFor(sysText ?: sysTint);
             if (hue) {
-                STUIStatusBarStyleAttributes *copy = [styleAttrs copy];
+                STUIStatusBarStyleAttributes *copy = nil;
 
-                // tint 的 alpha 锚点：imageTintColor 没下发就拿 textColor 当参照
-                UIColor *tintAnchor = sysTint ?: sysText;
-                UIColor *tint = svpnReplaceKeepingAlpha(tintAnchor, hue);
-                if (tint) {
-                    [copy setImageTintColor:tint];
+                if (sysTint) {
+                    // alpha 来自 sysTint 自己 —— 不借用别的槽位的 alpha
+                    UIColor *tint = svpnReplaceKeepingAlpha(sysTint, hue);
+                    if (tint) {
+                        copy = copy ?: [styleAttrs copy];
+                        [copy setImageTintColor:tint];
+                    }
                 }
 
-                // dimmed 通常就是「淡一档的 tint」，系统原值本身带低 alpha。
-                // 沿用它的 alpha 正是我们要的效果 —— 比原来硬写 0.2 精确，
-                // 而且不会把「本来就该淡」的语义压成一个死值。
-                UIColor *dimmedAnchor = sysDimmed ?: tintAnchor;
-                UIColor *dimmed = svpnReplaceKeepingAlpha(dimmedAnchor, hue);
-                if (dimmed) {
-                    [copy setImageDimmedTintColor:dimmed];
+                if (sysDimmed) {
+                    // alpha 来自 sysDimmed 自己。系统给的低 alpha
+                    // （「淡一档」的语义）被原样保留，我们不放大也不壓小。
+                    UIColor *dimmed = svpnReplaceKeepingAlpha(sysDimmed, hue);
+                    if (dimmed) {
+                        copy = copy ?: [styleAttrs copy];
+                        [copy setImageDimmedTintColor:dimmed];
+                    }
                 }
 
-                styleAttrs = copy;
-                // 这一路不记账：styleAttrs 是临时对象，改它只影响本次绘制。
-                // 要还原得落到具体视图上，而视图侧没有与 imageTintColor 对应的
-                // 安全 setter（setTintColor: 会传播到子视图）。
-                // 这一路的色本来就会在下一次样式下发时被自然覆盖。
+                if (copy) {
+                    styleAttrs = copy;
+                    // 这一路不记账：styleAttrs 是临时对象，改它只影响本次绘制。
+                    // 要还原得落到具体视图上，而视图侧没有与 imageTintColor 对应的
+                    // 安全 setter（setTintColor: 会传播到子视图）。
+                    // 这一路的色本来就会在下一次样式下发时被自然覆盖。
+                }
             }
         } @catch (NSException *e) {
         }

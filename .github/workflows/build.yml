@@ -9,7 +9,7 @@ on:
       - release
 
 env:
-  VERSION: 2.2-2
+  VERSION: 2.2-3
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
@@ -34,11 +34,11 @@ jobs:
 
           cnt() { printf '%s' "$1" | grep -Fc -- "$2" || true; }
 
-          echo "--- 0. 确认推上来的是 2.2-2（根本修复版），不是旧文件 ---"
+          echo "--- 0. 确认推上来的是 2.2-3（根本修复版），不是旧文件 ---"
           for old in gSVPNOriginals SVPNRememberOriginal SVPNRestorePaintedViewsNow \
                      gSVPNPainted kSVPNStyleKey SVPN_DIAG SVPN_DISABLE_ENTRY_MERGE; do
             if printf '%s' "$CODE" | grep -q -- "$old"; then
-              echo "✗ 源码里还有旧结构 $old —— 推的不是 2.2-2"; exit 1
+              echo "✗ 源码里还有旧结构 $old —— 推的不是 2.2-3"; exit 1
             fi
           done
           echo "  ✓ 旧结构已清空"
@@ -67,7 +67,7 @@ jobs:
           test "$(cnt "$SRC" 'dataByReplacingEntry')" -eq 0 \
             || { echo "✗ 还在改写系统 data（塞残缺 entry → 图标整块空白）"; exit 1; }
 
-          echo "--- 5. ★ 2.2-2 核心修复：换色相但保住系统 alpha ---"
+          echo "--- 5. ★ 2.2-3 核心修复：换色相但保住系统 alpha ---"
           # colorWithAlphaComponent: 是**替换** alpha 不是叠加。
           # 系统给未激活格的 alpha 接近 1，被压到 0.2 后深底≈全黑、浅底≈全白，
           # 两种背景下都「彻底空着」—— 这就是用户报的「不定期图标空白」。
@@ -77,10 +77,10 @@ jobs:
             || { echo "✗ 保 alpha 的换色函数缺失"; exit 1; }
           test "$(cnt "$CODE" 'svpnReplaceKeepingAlpha(inactiveColor,')" -eq 1 \
             || { echo "✗ setInactiveColor 没走保 alpha 路径"; exit 1; }
-          test "$(cnt "$CODE" 'svpnReplaceKeepingAlpha(dimmedAnchor, hue)')" -eq 1 \
+          test "$(cnt "$CODE" 'svpnReplaceKeepingAlpha(sysDimmed, hue)')" -eq 1 \
             || { echo "✗ imageDimmedTintColor 没走保 alpha 路径"; exit 1; }
 
-          echo "--- 5b. ★★ 结构性不变量：坏色没有产生的机会（2.2-2 根本修复）---"
+          echo "--- 5b. ★★ 结构性不变量：坏色没有产生的机会（根本修复）---"
           # 判「能不能造出看不见的色」这件事，而不是逐行盯哪一处改对了。
           # ① 全工程只有一处造色。
           test "$(cnt "$CODE" 'UIColor colorWithRed:')" -eq 1 \
@@ -102,6 +102,16 @@ jobs:
           # ③ 色相绝不直接进 UI 槽位：所有染色点必须再包一层保 alpha。
           test "$(cnt "$CODE" 'svpnReplaceKeepingAlpha(')" -ge 5 \
             || { echo "✗ 有染色点绕过保 alpha 包装"; exit 1; }
+          # ④ ★★ 绝不凭空造值：系统没给的槽位就别设。
+          #    原版两个 bug 本质都是「在系统没要求的地方替它做决定」。
+          if grep -Eq 'sysDimmed \?: (sysTint|tintAnchor)' "$SRC"; then
+            echo "✗ 系统没给 dimmed 时拿 tint 顶替 —— 凭空造值，会改变系统绘制语义"; exit 1
+          fi
+          if grep -Eq 'sysTint \?: sysText' "$SRC"; then
+            echo "✗ 系统没给 imageTintColor 时拿 textColor 顶替 —— 凭空造值"; exit 1
+          fi
+          test "$(cnt "$CODE" 'if (sysDimmed) {')" -eq 1 \
+            || { echo "✗ dimmed 没有「系统给了才设」的守卫"; exit 1; }
 
           echo "--- 6. 还原账本（2.1-10 + 重写简化）---"
           test "$(cnt "$CODE" 'static NSMapTable *gSVPNLedger = nil;')" -eq 1 \
@@ -128,7 +138,7 @@ jobs:
           grep -q 'format=tarfile.GNU_FORMAT' devkit/mkdeb.sh \
             || { echo "✗ tar 没指定 GNU_FORMAT（PAX 头会让 dpkg 装不上）"; exit 1; }
 
-          echo "✓ 补丁在位（2.2-2）"
+          echo "✓ 补丁在位（2.2-3）"
 
       - name: Source self-check (single source of truth)
         run: |

@@ -171,8 +171,8 @@ CASES = [
                 "UIColor *paint = svpnReplacementFor(inactiveColor);",
                 "S5d setInactiveColor 走保 alpha"),
     one_replace("B20 dimmed 色绕过保 alpha",
-                "                UIColor *dimmed = svpnReplaceKeepingAlpha(dimmedAnchor, hue);",
-                "                UIColor *dimmed = hue;",
+                "                    UIColor *dimmed = svpnReplaceKeepingAlpha(sysDimmed, hue);",
+                "                    UIColor *dimmed = hue;",
                 "S5e imageDimmedTintColor 走保 alpha"),
     one_replace("B21 兜底色写死一个小 alpha（同样是看不见）",
                 "    _lightReplacementColor = l ?: SVPNColorRGBA(0.196, 0.780, 0.349, 1.0);",
@@ -391,6 +391,15 @@ CASES = [
                 "}\n\n"
                 "static void SVPNRestoreAsync(void) {",
                 "S11g 不做定时轮询"),
+    one_replace("B66 ★ 系统没给 dimmed 时拿 tint 顶替（凭空造值）",
+                "                if (sysDimmed) {",
+                "                if (YES) {\n"
+                "                    UIColor *dimmedAnchor = sysDimmed ?: sysTint;",
+                "S11i tint / dimmed 只在系统给了值时才设"),
+    one_replace("B67 dimmed 分支改用 ?: 兜底（等价于凭空造值）",
+                "                    UIColor *dimmed = svpnReplaceKeepingAlpha(sysDimmed, hue);",
+                "                    UIColor *dimmed = svpnReplaceKeepingAlpha(sysDimmed ?: sysTint, hue);",
+                "S11i tint / dimmed 只在系统给了值时才设"),
     one_replace("B65 染色路径里加一次强制重绘（和系统绘制节奏打架）",
                 "            if (paint) {\n"
                 "                SVPNRecord(self, @\"ac\", activeColor, paint);\n"
@@ -404,8 +413,8 @@ CASES = [
     # ---------------------------------------------------------------
     # S9 版本号一致性
     # ---------------------------------------------------------------
-    one_replace("B57 版本号三处不一致（装着 2.2-2，报 2.1-11）",
-                "SingleVPN 2.2-2 已安装",
+    one_replace("B57 版本号三处不一致（装着 2.2-3，报 2.1-11）",
+                "SingleVPN 2.2-3 已安装",
                 "SingleVPN 2.1-11 已安装",
                 "S9a 三处版本号一致", file="mk"),
 ]

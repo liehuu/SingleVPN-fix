@@ -293,7 +293,7 @@ chk("S5c 保 alpha 函数真的取了原色 alpha 并沿用它",
 chk("S5d setInactiveColor 走保 alpha 路径",
     "svpnReplaceKeepingAlpha(inactiveColor," in _g17)
 chk("S5e imageDimmedTintColor 走保 alpha 路径",
-    "svpnReplaceKeepingAlpha(dimmedAnchor, hue)" in _g17)
+    "svpnReplaceKeepingAlpha(sysDimmed, hue)" in _g17)
 chk("S5f 不写死 alpha 常量",
     re.search(r"colorWithRed:[^\]]*alpha:0\.\d", nc) is None)
 
@@ -568,6 +568,26 @@ chk("S11g 不做定时轮询（不长期和系统抢同一属性）",
     "DISPATCH_SOURCE_TYPE_TIMER" not in nc and "dispatch_source_create" not in nc)
 chk("S11h 染色路径里不主动重绘（只在系统自己的绘制链路内换色）",
     "setNeedsDisplay" not in nc and "setNeedsLayout" not in nc)
+
+# ⑤ ★★ 绝不凭空造值：系统没给的槽位就别设。
+#    这一条是本轮最重要的一条自律，比「保 alpha」更上位：
+#    原版两个 bug（回填空壳 entry、写死 alpha 0.2）本质都是
+#    「在系统没要求的地方替它做决定」。
+# ★ 定位必须按**类**切段：applyStyleAttributes: 在 StringView 和
+#   WifiSignalView 各有一个，body_of() 会命中前面那个（StringView），
+#   于是判的根本不是这段代码 —— 判据锚错地方等于没判。
+_wifi_seg = _g17[_g17.index("%hook STUIStatusBarWifiSignalView"):]
+_wifi_seg = _wifi_seg[:_wifi_seg.index("%end")]
+_wifi_style = body_of("- (void)applyStyleAttributes:(STUIStatusBarStyleAttributes *)styleAttrs", _wifi_seg)
+chk("S11i tint / dimmed 只在系统给了值时才设（不拿别的槽位顶替）",
+    # 必须是 if (sysTint) / if (sysDimmed) 守卫，而不是 sysTint ?: sysText 这类兜底
+    bool(_wifi_style)
+    and "if (sysTint) {" in _wifi_style
+    and "if (sysDimmed) {" in _wifi_style
+    and "sysTint ?: sysText" not in _wifi_style
+    and "sysDimmed ?: tintAnchor" not in _wifi_style
+    and "sysDimmed ?: sysTint" not in _wifi_style,
+    "wifi style 体 %d 字节" % len(_wifi_style))
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
