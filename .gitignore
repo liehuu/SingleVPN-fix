@@ -151,3 +151,7 @@ _bak_*
 # 而且 pyc 里带着本机绝对路径，CI 上纯属噪音）
 __pycache__/
 *.pyc
+# ★ 闸门用 PYTHONPYCACHEPREFIX 把缓存读写挪到这个空目录，绕开
+#   「改字符不改长度 → (mtime,size) 判据失效 → 读到旧字节码」那个坑
+#   （S14d 曾因此在 CI 上假绿）。它永远不该进仓库。
+.pycache-disabled/

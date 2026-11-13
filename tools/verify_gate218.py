@@ -40,6 +40,12 @@ FILES = {
     # ★ 2.2-5 收尾：诊断解析器也进了闸门（S14 组判的是它与源码的格式契约）。
     #   同一个规则：判据覆盖了哪个文件，就必须在还原清单里。
     "dp": os.path.join(_REPO, "tools", "read_diag.py"),
+    # ★★ S14f 判的是**闸门脚本自己**有没有用 importlib —— 所以闸门脚本本身
+    #    也必须在还原清单里。第一版漏了这个键，B108 用了默认 file="x"，
+    #    结果往 SingleVPN.x 里找 exec(compile(...)) → 命中 0 次 → 整轮中断。
+    #    这正是我自己写下的规则：「判据覆盖了哪个文件，就必须进反向验证的
+    #    还原清单（FILES）；否则注入后文件不回滚。」
+    "cs": os.path.join(_REPO, "tools", "check_source.py"),
 }
 _orig = {k: io.open(p, encoding="utf-8", newline="").read() for k, p in FILES.items()}
 
@@ -706,6 +712,27 @@ CASES = [
                 "def parse(path):",
                 "def parse_disabled(path):",
                 "S14a2 解析器不是空壳", file="dp"),
+
+    # ★★ S14f 的反向用例（CI 上真实换来的教训）。
+    #    把 importlib 加载方式注回闸门 → 必须红。
+    #    这个缺陷的实际后果是**假绿**：字节码缓存按 (mtime, size) 判有效，
+    #    「改字符不改长度」的注入 size 不变、同秒写入 mtime 也可能不变 →
+    #    闸门读到注入前的旧字节码 → 判据说自己过了。
+    # ★ 锚点只用**一行**，不要跨行。跨行锚点第一版漏了行首 8 个空格，
+    #   命中 0 次 —— 而 verify 脚本在这种情况下会断言中断整轮，
+    #   看起来像判据失效，实际是用例自己写错了锚点。
+    #   单行锚点还有个好处：注入后语法仍然成立，闸门才能真的跑到 S14f。
+    one_replace("B108 闸门改回用 importlib 加载解析器（会读字节码缓存 → 假绿）",
+                '        exec(compile(_diag_src, _DIAG_PY, "exec"), _ns)',
+                '        import importlib.util as _il\n'
+                '        _sp2 = _il.spec_from_file_location("rd", _DIAG_PY)\n'
+                '        _m2 = _il.module_from_spec(_sp2)\n'
+                '        _sp2.loader.exec_module(_m2)',
+                "S14f 闸门不用 importlib 加载被测脚本", file="cs"),
+
+    # S14 组之外的收尾用例：B57（版本号）。
+    # ★ B57 一直放在列表最后，但它属于 S9 版本号一致性，不属于 S14。
+    #   分组注释必须和编号对得上，否则复盘时按编号找判据会找不到。
 
     # ---------------------------------------------------------------
     # S9 版本号一致性

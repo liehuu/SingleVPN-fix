@@ -1073,11 +1073,32 @@ if os.path.exists(_DIAG_PY):
     _diag_src = io.open(_DIAG_PY, encoding="utf-8").read()
     _diag = {}
     try:
-        import importlib.util
-        _spec = importlib.util.spec_from_file_location("read_diag_for_gate", _DIAG_PY)
-        _diag = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_diag)
-    except Exception as _e:
+        # ★★★ 必须用 exec(compile(src)) 直读磁盘源码，**不能**用
+        #     importlib.util.spec_from_file_location。
+        #
+        #     为什么（CI 实测踩到，本地看不出来）：
+        #     importlib 会读写 __pycache__，而字节码缓存的有效性判据是
+        #     **(mtime, size)**，不是内容哈希。B104 那条注入把两个正则分组
+        #     交换位置 —— 字符数一模一样，**文件大小不变**；如果注入写盘与
+        #     上一次 import 落在同一秒内，mtime 也可能相同 → 缓存命中 →
+        #     拿到的还是注入前的旧字节码 → S14d 用正确的正则跑 → **假绿**。
+        #     实测：本地 S14d 红、CI 上 S14d 绿，同一份代码同一次注入。
+        #     这就是「本地全过而 CI 挂」的镜像情形，根因是判据自己读了缓存。
+        #
+        #     exec(compile()) 每次都编译当前磁盘内容，与任何缓存无关。
+        #     顺带还有一个好处：不需要往仓库里落 __pycache__（CI 上是干净
+        #     checkout，本来也不该产生构建垃圾）。
+        _ns = {"__name__": "read_diag_for_gate", "__file__": _DIAG_PY}
+        exec(compile(_diag_src, _DIAG_PY, "exec"), _ns)
+
+        class _Mod(object):
+            pass
+
+        _diag = _Mod()
+        for _k, _v in _ns.items():
+            if not _k.startswith("__"):
+                setattr(_diag, _k, _v)
+    except BaseException as _e:
         _diag = None
         _import_err = repr(_e)
 else:
@@ -1163,8 +1184,19 @@ _sel_ok, _sel_detail = False, "未跑"
 if _diag:
     try:
         import subprocess as _sp
-        _pr = _sp.run([sys.executable, _DIAG_PY, "--selftest"],
-                      capture_output=True, text=True, timeout=90)
+        # ★★ 必须禁掉字节码缓存，否则这条判据会读到旧的 .pyc：
+        #    B104 那种「改字符不改长度」的注入，size 不变、同秒内 mtime 也可能
+        #    不变 → Python 认为缓存有效 → 子进程跑的还是注入前的代码 → 假绿。
+        #    实测：本地红、CI 绿，同一个成因。
+        #
+        #    PYTHONDONTWRITEBYTECODE=1  不写新缓存
+        #    PYTHONPYCACHEPREFIX=<空目录> 把缓存读写都挪到一个不存在的空路径
+        #    两条一起用才彻底；只禁写不禁读的话，仓库里已有的 .pyc 还是会被用上。
+        _env = dict(os.environ)
+        _env["PYTHONDONTWRITEBYTECODE"] = "1"
+        _env["PYTHONPYCACHEPREFIX"] = os.path.join(_REPO, "tools", ".pycache-disabled")
+        _pr = _sp.run([sys.executable, "-B", _DIAG_PY, "--selftest"],
+                      capture_output=True, text=True, timeout=90, env=_env)
         _out = (_pr.stdout or "")
         _tail = _out.strip().splitlines()
         _detail_line = _tail[-1] if _tail else (_pr.stderr or "")[-200:]
@@ -1180,6 +1212,57 @@ if _diag:
         _sel_detail = "跑了但抛 %r" % _e
 chk("S14e read_diag.py --selftest 实跑通过（分层判定真的分得开，坏文件真被拒绝）",
     _sel_ok, _sel_detail)
+
+# ★★ S14f：闸门自己不许经 importlib 加载被测脚本。
+#
+# 这一条是 CI 上换来的教训，不是洁癖：
+#   importlib 走 __pycache__，而字节码缓存的有效性判据是 (mtime, size)，
+#   **不是内容哈希**。B104 那种「交换两个正则分组」的注入，字符数完全一样、
+#   size 不变；同秒内写盘连 mtime 也可能不变 → 缓存命中 → 读到注入前的
+#   旧字节码 → S14d 假绿。
+#   实测表现：本地 S14d 红、CI 上 S14d 绿，同一份代码同一次注入。
+#   这比「漏报」更坏，因为它会让我相信一个坏掉的解析器是好的。
+#
+# 判据形态：用 **ast 解析本脚本的语法树**，查是否真的调用了那几个名字。
+#
+# ★ 为什么不能用 strip_code / strip_comments_only 这两个自制剥离器：
+#   它们是为 Objective-C 写的 —— 只认 `//` 与 `/* */`，**不认 Python 的 `#`**。
+#   第一版用 strip_code 查，命中的是 1077 行那句历史说明注释（`# ... spec_from_file_location。`），
+#   离真正要拦的东西十万八千里 —— 判据红得毫无意义。
+#   这也解释了两轮修法都错在哪：换剥离器不解决问题，换**判据维度**才解决。
+#   ast 里注释与字符串本来就不存在，只有真实的调用节点。
+import ast as _ast
+
+_gate_path = os.path.abspath(__file__)
+try:
+    _gate_tree = _ast.parse(io.open(_gate_path, encoding="utf-8").read())
+    _BAD_LOADERS = {"spec_from_file_location", "SourceFileLoader",
+                    "exec_module", "import_module"}
+    _importlib_calls = []
+    for _node in _ast.walk(_gate_tree):
+        if not isinstance(_node, _ast.Call):
+            continue
+        _f = _node.func
+        _name = None
+        if isinstance(_f, _ast.Attribute):
+            _name = _f.attr
+            # 只认 importlib 上的 / loader 上的，避免误伤同名的自定义函数
+            _base = _f.value
+            _base_name = getattr(_base, "id", None) or getattr(_base, "attr", None)
+            if _base_name not in ("importlib", "util", "loader", "spec"):
+                continue
+        elif isinstance(_f, _ast.Name):
+            _name = _f.id
+        if _name in _BAD_LOADERS:
+            _importlib_calls.append("%s @ line %d" % (_name, _node.lineno))
+    _ast_err = ""
+except SyntaxError as _e:
+    _importlib_calls = []
+    _ast_err = "本脚本语法错，无法解析：%r" % _e
+
+chk("S14f 闸门不用 importlib 加载被测脚本（会读字节码缓存 → 注入后可能假绿）",
+    not _importlib_calls and not _ast_err,
+    "命中 %s %s" % (_importlib_calls, _ast_err))
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
