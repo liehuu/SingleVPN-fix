@@ -19,6 +19,7 @@
 """
 import io
 import os
+import re
 import subprocess
 import sys
 
@@ -53,6 +54,43 @@ _orig = {k: io.open(p, encoding="utf-8", newline="").read() for k, p in FILES.it
 def run_check():
     r = subprocess.run([PY, CHECK], capture_output=True, text=True)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+# ★★ 提取失败列表必须锚「结构」，不能锚「文字」。
+#
+# 第一版是 `out.split("失败：")[-1]` —— 拿最后一个「失败：」当切分点。
+# 这在 B104 上炸了：新加的 S14g detail 里写了「模拟/解析失败：%r」，
+# 于是最后一个「失败：」跑到了 detail 内部，切出来的块从 S14g 中途开始，
+# S14d 那行被切在块外 → 断言「该报的是 S14d」失败 → 整轮中断。
+#
+# 这不是用例写错，是**判据的取数方式锚在了自由文本上**：detail 是给人看的
+# 任意字符串，谁以后写一句含「失败：」的说明都会再踩一次。
+# 所以改成认 check_source.py 的**固定输出结构**：
+#   「失败：」单独占一行 + 紧随其后的若干「  - <判据名> <detail>」行。
+# 只认「行首两个空格 + '- '」的行，且必须在「通过 N 项，失败 M 项」之后。
+_FAIL_LINE = re.compile(r"^  - (\S.*)$")
+_SUMMARY = re.compile(r"^通过 \d+ 项，失败 \d+ 项\s*$", re.M)
+
+
+def _fail_block_of(out):
+    """从闸门输出里取出失败判据名的拼接串（只认结构性失败行）。
+
+    返回的是所有失败判据的「名字 + detail」行拼起来，供 `expect in` 断言。
+    取不到任何失败行时返回空串 —— 那样断言必然失败并打印原始输出，
+    比返回整段输出更好（后者可能让 expect 蒙对，掩盖取数失效）。
+    """
+    # 从「通过 N 项，失败 M 项」这一行之后开始找，避开前面各判据的正文。
+    # 认不出汇总行时退化为全文扫描（宁可多找，也不能少找 —— 少了就是假 FAIL）。
+    idx = 0
+    for m in _SUMMARY.finditer(out):
+        idx = m.end()
+    body = out[idx:]
+    names = []
+    for ln in body.splitlines():
+        m = _FAIL_LINE.match(ln)
+        if m:
+            names.append(m.group(1))
+    return "\n".join(names)
 
 
 def one_replace(name, old, new, expect_gate, count=1, file="x"):
@@ -730,6 +768,54 @@ CASES = [
                 '        _sp2.loader.exec_module(_m2)',
                 "S14f 闸门不用 importlib 加载被测脚本", file="cs"),
 
+    # ---------------------------------------------------------------
+    # S14g / S14h / S14i：C 端格式串 ↔ 解析器（本轮补的漏）
+    #
+    # 这三条的注入都必须落在 **SingleVPN.x 的 snprintf 上**，不能落到
+    # read_diag.py —— 因为要证明的正是「判据锚在 C 那头」。落到 Python 侧
+    # 就只能证明解析器自己变了，证明不了「C 改了闸门会不会红」。
+    #
+    # ★★ expect 用 **list** 表示「失败列表必须恰好是这几条」（严格断言），
+    #    用 str 则只断言「包含」（老用例的形态）。
+    #    为什么新用例必须严格：第一版 B109 我一次注入同时改了格式串列序
+    #    和实参顺序，实测点亮 S14g + S14h 两条 —— 那就无法断言「是哪一条
+    #    拦下的」，S14h 是否真的独立有效也就无从证明。
+    #    拆成 B109（只改格式串）/ B110（只改实参）后各自只点亮一条，干净。
+    #    这跟「判据不许重复」是同一条规则的两种表现：**要么判据不重复，
+    #    要么用例自己把两件事分开注入**。
+    # ---------------------------------------------------------------
+    # B109：只把数据行的格式串列序改掉（color 与 extra 两个转换符换位），
+    #   实参表达式一个字不动。这是最现实的一种改动（有人觉得 extra 该靠前）。
+    #   后果：格式串拿 %-5u 去接一个 NSString* → 模拟器严格拒绝并抛错，
+    #   解析器就算能读也是错位的。**只点 S14g**（S14h 判实参，没动）。
+    one_replace("B109 C 端数据行格式串把 color 与 extra 两个转换符换位",
+                '"%-5u %-7u %d     %d   %-8s  %-5u  %s\\n",\n'
+                '                     e->seq, e->ms, (int)e->ready, (int)e->dec,\n'
+                '                     SVPNColorName(e->colorKind), e->extra, SVPNEventName(e->ev));',
+                '"%-5u %-7u %d     %d   %-5u  %-8s  %s\\n",\n'
+                '                     e->seq, e->ms, (int)e->ready, (int)e->dec,\n'
+                '                     SVPNColorName(e->colorKind), e->extra, SVPNEventName(e->ev));',
+                ["S14g C 端数据行格式串渲染出的真行能被解析器正确读出"]),
+    # B110：只把 e->seq 与 e->ms 两个同类型 %u 互换，格式串一个字不动。
+    #   ★ 这条是 S14h 存在的唯一理由：转换符序列完全不变（都是 %u %u），
+    #     渲染出来的行按位置填值也不变 → **S14g 全程绿**。
+    #     只有钉住实参表达式才能发现。没有这条注入，S14h 就是个摆设。
+    one_replace("B110 C 端数据行把 seq 与 ms 两个 %u 互换（转换符序列不变，S14g 拦不住）",
+                "                     e->seq, e->ms, (int)e->ready, (int)e->dec,",
+                "                     e->ms, e->seq, (int)e->ready, (int)e->dec,",
+                ["S14h C 端数据行实参的语义顺序"]),
+    # B111：首行关键字 total= 改成 cnt=（解析器按 total= 匹配 → 找不到首行）
+    one_replace("B111 C 端首行把 total= 改成 cnt=（解析器的头正则匹配不上）",
+                '"# SingleVPN diag v" SVPN_VERSION_STR "  total=%u kept=%u slots=%d\\n"',
+                '"# SingleVPN diag v" SVPN_VERSION_STR "  cnt=%u kept=%u slots=%d\\n"',
+                ["S14i C 端首行格式串"]),
+    # B112：首行左侧不写版本号（v 后面直接跟 total）→ 解析出的 version 变空，
+    #   与源码 SVPN_VERSION_STR 不符。这正是 S14i 断言 version 的用处。
+    one_replace("B112 C 端首行漏掉版本号（解析出的 version 与源码对不上）",
+                '"# SingleVPN diag v" SVPN_VERSION_STR "  total=%u kept=%u slots=%d\\n"',
+                '"# SingleVPN diag v" "  total=%u kept=%u slots=%d\\n"',
+                ["S14i C 端首行格式串"]),
+
     # S14 组之外的收尾用例：B57（版本号）。
     # ★ B57 一直放在列表最后，但它属于 S9 版本号一致性，不属于 S14。
     #   分组注释必须和编号对得上，否则复盘时按编号找判据会找不到。
@@ -750,12 +836,104 @@ def restore_all():
         io.open(p, "w", encoding="utf-8", newline="").write(_orig[k])
 
 
+# ---------------------------------------------------------------------------
+# 取数函数自身必须先被验一遍。
+#
+# 为什么放在 main() 最前面：`_fail_block_of` 是全部用例断言的**唯一**依据。
+# 它一旦取错，整轮的「已拦下」都可能是假的（假 FAIL 会让人去改判据，
+# 假 PASS 更坏 —— 会让人相信一个坏判据是好的）。这跟「闸门自己也要进闸门」
+# 是同一件事，只不过这次的工具是几行字符串处理，最容易被当成「显然正确」。
+#
+# ★ 用例必须是**真实形态**的样本，不能是我随手编的好看输入：
+#   第 ② 例就是 B104 实际炸出来的那种输出（detail 里含「失败：」）。
+# ---------------------------------------------------------------------------
+def _selfcheck_fail_block():
+    cases = [
+        # (名字, 输入, 必须含, 必须不含)
+        ("正常：两行都能取到",
+         "通过 106 项，失败 2 项\n失败：\n"
+         "  - S14g C 端数据行格式串 模拟/解析失败：ValueError(...)\n"
+         "  - S14i C 端首行格式串 解析抛了 SystemExit()\n",
+         ["S14g", "S14i"], ["S1a"]),
+        # ★ B104 回归：detail 里含「失败：」不能把前面的失败行切掉
+        ("detail 含「失败：」仍能取全",
+         "通过 106 项，失败 2 项\n失败：\n"
+         "  - S14d 导出行的字段顺序与解析器一致（行为级） 解析抛了 SystemExit('...')\n"
+         "  - S14g C 端数据行格式串 模拟/解析失败：ValueError(\"...\")\n",
+         ["S14d", "S14g"], []),
+        ("全绿时返回空（防 expect 蒙对）",
+         "  OK   S14d 导出行的字段顺序 解析结果 {...}\n通过 106 项，失败 0 项\n全部通过\n",
+         [], ["S14d", "通过"]),
+        ("汇总行之前的 '- ' 行不被当失败",
+         "  OK   S12a 环形缓冲  -> 细节:\n  - 这不是失败行\n"
+         "通过 106 项，失败 1 项\n失败：\n  - S12d 落盘被 @try 包住 没包\n",
+         ["S12d"], ["这不是失败行"]),
+        ("崩在汇总行之前（语法错）→ 不崩，返回空",
+         'Traceback (most recent call last):\nSyntaxError: invalid syntax\n',
+         [], []),
+    ]
+    bad = []
+    for name, src, must, mustnot in cases:
+        got = _fail_block_of(src)
+        if not all(s in got for s in must) or any(s in got for s in mustnot):
+            bad.append("%s → %r" % (name, got[:160]))
+    return bad
+
+
+# ---------------------------------------------------------------------------
+# 严格模式的判定函数也自己验一遍。
+#
+# 严格模式做的事是「失败判据集合必须恰好等于期望集合」。它有两个可能坏的
+# 方向，两个都必须实测：
+#   ① 太松（退化成包含判断）→ 一次注入点亮两条也照样通过，严格就白加了；
+#   ② 太紧（任何输入都判不等）→ 新用例整轮中断，看起来像判据失效。
+# 所以下面左右各给一例。
+# ---------------------------------------------------------------------------
+def _names_of(block):
+    return [ln.split()[0] for ln in block.splitlines() if ln.strip()]
+
+
+def _selfcheck_strict_match():
+    """返回坏掉的用例描述列表（空 = 全过）。"""
+    bad = []
+
+    def expect_fail(desc, got, want):
+        # 期望「不相等」（严格模式必须拒绝）
+        if got == want:
+            bad.append("%s：本该拒绝却判等（太松）%s" % (desc, got))
+
+    def expect_pass(desc, got, want):
+        if got != want:
+            bad.append("%s：本该判等却拒绝（太紧）%s vs %s" % (desc, got, want))
+
+    a = _names_of("S14g xxx\n")
+    b = _names_of("S14g xxx\nS14h yyy\n")
+    c = _names_of("")
+
+    expect_fail("多条 vs 单条", b, a)          # 点两条、期望一条 → 必须拒
+    expect_fail("单条 vs 两条", a, b)          # 点一条、期望两条 → 必须拒
+    expect_fail("有失败 vs 期望空", a, c)      # 有失败、期望空 → 必须拒
+    expect_pass("完全一致", b, _names_of("S14g xxx\nS14h yyy\n"))
+    expect_pass("都空", c, [])
+    return bad
+
+
 def main():
+    _sc = _selfcheck_fail_block()
+    assert not _sc, (
+        "★ 取数函数 _fail_block_of 自己坏了 —— 下面所有用例的断言都不可信，先修它：\n  "
+        + "\n  ".join(_sc))
+    _sm = _selfcheck_strict_match()
+    assert not _sm, (
+        "★ 严格模式判定自己坏了（太松或太紧），先修它：\n  " + "\n  ".join(_sm))
+    print("前置：取数函数自检 %d 例 + 严格模式自检 %d 例全过 ✓" % (5, 5))
+
     rc, out = run_check()
     assert rc == 0, "干净态自检就挂了，先修：\n" + out[-1500:]
     print("前置：干净态自检全绿 ✓\n")
 
     passed = 0
+    n_strict = 0
     try:
         for name, fk, fn, expect in CASES:
             path = FILES[fk]
@@ -768,14 +946,30 @@ def main():
             # ② 断言是哪条判据拦下的
             rc, out = run_check()
             assert rc != 0, "%s：注入后自检竟然全绿 = 判据是摆设" % name
-            fail_block = out.split("失败：")[-1] if "失败：" in out else ""
-            assert expect in fail_block, (
-                "%s：该报的是「%s」，实际失败列表：\n%s" % (name, expect, fail_block[:600]))
+            fail_block = _fail_block_of(out)
+            if isinstance(expect, (list, tuple)):
+                # ★ 严格模式：失败判据集合必须**恰好**是列出的这些。
+                #   多一条少一条都算失败 —— 多一条说明这次注入同时触碰了两件
+                #   事（无法断言是哪条拦下的），少一条说明列出的判据没生效。
+                got_names = [ln.split()[0] for ln in fail_block.splitlines() if ln.strip()]
+                want_names = [e.split()[0] for e in expect]
+                assert got_names == want_names, (
+                    "%s：期望失败集合恰好 %s，实际 %s\n%s"
+                    % (name, want_names, got_names, fail_block[:700]))
+                n_strict += 1
+                shown = "、".join(want_names)
+            else:
+                assert expect in fail_block, (
+                    "%s：该报的是「%s」，实际失败列表：\n%s" % (name, expect, fail_block[:700]))
+                shown = expect
             # ③ 还原并确认干净
             restore_all()
             rc2, out2 = run_check()
             assert rc2 == 0, "%s：还原后自检仍挂：\n%s" % (name, out2[-800:])
-            print("  ✓ %-50s 已拦下（%s）" % (name, expect))
+            mark = "  ✓ %-50s 已拦下（%s）" % (name, shown)
+            if isinstance(expect, (list, tuple)):
+                mark += "  [严格]"
+            print(mark)
             passed += 1
     finally:
         restore_all()
@@ -784,8 +978,8 @@ def main():
     assert rc == 0, "最终复跑不干净：\n" + out[-1200:]
     for k, p in FILES.items():
         assert io.open(p, encoding="utf-8", newline="").read() == _orig[k], "文件没还原: " + k
-    print("\n✓ 反向验证全过（%d 例，零 SKIP），%d 个文件均已还原且复跑干净"
-          % (passed, len(FILES)))
+    print("\n✓ 反向验证全过（%d 例，零 SKIP，其中 %d 例严格断言失败集合恰好相等），"
+          "%d 个文件均已还原且复跑干净" % (passed, n_strict, len(FILES)))
 
 
 if __name__ == "__main__":

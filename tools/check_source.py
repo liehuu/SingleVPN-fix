@@ -1264,6 +1264,218 @@ chk("S14f 闸门不用 importlib 加载被测脚本（会读字节码缓存 → 
     not _importlib_calls and not _ast_err,
     "命中 %s %s" % (_importlib_calls, _ast_err))
 
+
+# ---------------------------------------------------------------------------
+# S14g / S14h / S14i：把 **C 端真实的 snprintf** 与解析器拴在一起。
+#
+# ★★ 为什么 S14d 不够（这是本轮补的漏，性质与 user-memory 第 2 条红线相同）：
+#    S14d 是拿 `_synth()` 生成的行喂 `parse()` —— 而 `_synth` 与 `parse` 都是
+#    read_diag.py 里我亲手写的两段代码。**它俩一致只证明我自己自洽**，
+#    对 SingleVPN.x 里那句 snprintf 的格式串**零约束力**。
+#    C 端一旦改列序 / 加列 / 换分隔符 / 改关键字，解析器就会静默读错字段，
+#    然后我拿错位的数值输出一份「看起来很合理」的结论 —— 比没有工具更糟。
+#    这就是「本地照抄一份逻辑做镜像验证」那个坑，只是这次抄的是我自己。
+#
+#    所以这三条把锚点钉在 **C 源码的格式串与实参表达式**上：
+#      S14g  用真实格式串模拟 printf 出行 → 喂 parse → 断言 7 个字段
+#      S14h  断言实参表达式的语义顺序（seq/ms/ready/dec/color/extra/event）
+#      S14i  同上，判首行（版本串 + total/kept/slots）
+#
+#    三条各自独立可反向验证：改格式串列序只红 S14g；把 e->seq/e->ms 互换
+#    只红 S14h；把 total= 改成 cnt= 只红 S14i。互不串味。
+# ---------------------------------------------------------------------------
+def _c_unescape(s):
+    """把 C 字符串字面量里的转义还原成真实字符（只处理本工程用到的几种）。"""
+    out, i = [], 0
+    _map = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            out.append(_map.get(n, "\\" + n))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def _sim_c_printf(fmt, vals):
+    """按最朴素的 C printf 规则把一行渲染出来。
+
+    ★ 只支持本工程用到的 `%[-][width][diuxs]`。遇到不认识的写法**直接抛**，
+      不做「尽力而为」的猜测 —— 静默用错的模拟结果去喂 parse，会造出一个
+      看起来通过、实际没在测的判据（比红更坏）。
+    """
+    out, vi, i, n = [], 0, 0, len(fmt)
+    while i < n:
+        c = fmt[i]
+        if c != "%":
+            out.append(c)
+            i += 1
+            continue
+        j = i + 1
+        spec = ""
+        while j < n and (fmt[j] in "-+0#" or fmt[j].isdigit()):
+            spec += fmt[j]
+            j += 1
+        if j >= n:
+            raise ValueError("格式串在 %% 之后截断：%r" % fmt)
+        conv = fmt[j]
+        j += 1
+        if conv == "%":
+            out.append("%")
+            i = j
+            continue
+        if conv not in "diuxs":
+            raise ValueError("不支持的转换符 %%%s（格式串 %r）" % (conv, fmt))
+        if spec.lstrip("-").startswith("0") and spec.lstrip("-")[1:].isdigit():
+            # %05u 这类零填充语义与我的空格填充不同，宁可红也不要错
+            raise ValueError("不支持零填充写法 %%%s（格式串 %r）" % (spec + conv, fmt))
+        if vi >= len(vals):
+            raise ValueError("实参不够：%r 需要更多值" % fmt)
+        v = vals[vi]
+        vi += 1
+        s = str(int(v)) if conv in "diux" else str(v)
+        left, width = spec.startswith("-"), 0
+        for ch in spec:
+            if ch.isdigit():
+                width = width * 10 + int(ch)
+        if width > len(s):
+            pad = " " * (width - len(s))
+            s = (s + pad) if left else (pad + s)
+        out.append(s)
+        i = j
+    if vi != len(vals):
+        raise ValueError("实参多了 %d 个（格式串 %r）" % (len(vals) - vi, fmt))
+    return "".join(out)
+
+
+def _split_export_calls(body, ver):
+    """从 SVPNExportDiag 函数体抽出每一处 snprintf 的 (格式串, 实参列表, 原文)。"""
+    res = []
+    for raw in re.findall(
+            r"snprintf\s*\(\s*line\s*,\s*sizeof\s*\(\s*line\s*\)\s*,\s*(.*?)\)\s*;",
+            body, re.S):
+        # SVPN_VERSION_STR 是宏，出现在引号外；先替换成它的字面量再抽相邻字面量
+        r = raw.replace("SVPN_VERSION_STR", '"%s"' % ver) if ver else raw
+        fmt = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', r))
+        tail = r[r.rfind('"') + 1:]
+        if '"' in tail:
+            # 实参里含字符串字面量 → 我这种按「最后一个引号」切分的办法不成立
+            raise ValueError("实参里出现字符串字面量，抽不出来：%r" % raw)
+        args = [a.strip() for a in tail.split(",") if a.strip()]
+        res.append((_c_unescape(fmt), args, raw))
+    return res
+
+
+_exp_ver_m = re.search(r'#define\s+SVPN_VERSION_STR\s+"([^"]*)"', src)
+_exp_ver = _exp_ver_m.group(1) if _exp_ver_m else ""
+_exp_calls = []
+_exp_err = ""
+try:
+    _exp_calls = _split_export_calls(body_of("SVPNExportDiag", ns), _exp_ver)
+except BaseException as _e:
+    _exp_err = repr(_e)
+
+_exp_head = None    # 首行：含 "SingleVPN diag" 与 "total="
+_exp_data = None    # 数据行：转换符 >= 5
+for _f, _a, _raw in _exp_calls:
+    _nconv = len(re.findall(r"%[-+0#0-9]*[diuxs]", _f))
+    if "SingleVPN diag" in _f and "total=" in _f:
+        _exp_head = (_f, _a, _raw)
+    elif _nconv >= 5:
+        _exp_data = (_f, _a, _raw)
+
+# --- S14g：数据行「列结构」——真实格式串渲染出的行必须被 parse 读成 7 个正确字段 ---
+_g_ok, _g_detail = False, _exp_err or "没找到数据行的 snprintf（转换符 >= 5）"
+if _diag and _exp_data:
+    try:
+        import tempfile as _tf
+        # 按格式串的转换符顺序给**互不相同**的值，字段错位才看得出来
+        _vals = [111, 222, 1, 0, "COLORTAG", 333, "EVENTTAG"]
+        _dline = _sim_c_printf(_exp_data[0], _vals).rstrip("\n")
+        _base = _diag._synth(1, [("CLEAR", "gate open", 0, 0)], ver="9.9-9").splitlines()
+        _base[2] = _dline                      # 只替换数据行，头行保持原样
+        _fd, _p = _tf.mkstemp(suffix=".txt")
+        os.close(_fd)
+        io.open(_p, "w", encoding="utf-8", newline="\n").write("\n".join(_base) + "\n")
+        try:
+            _h2, _r2 = _diag.parse(_p)
+        finally:
+            os.remove(_p)
+        _row2 = _r2[0]
+        _g_ok = (_row2["seq"] == 111 and _row2["ms"] == 222 and _row2["ready"] == 1
+                 and _row2["dec"] == 0 and _row2["color"] == "COLORTAG"
+                 and _row2["extra"] == 333 and _row2["ev"] == "EVENTTAG")
+        _g_detail = "格式串 %r → %r → %s" % (_exp_data[0], _dline, dict(_row2))
+    except BaseException as _e:
+        _g_detail = "格式串 %r 模拟/解析失败：%r" % (_exp_data[0], _e)
+chk("S14g C 端数据行格式串渲染出的真行能被解析器正确读出 7 个字段",
+    _g_ok, _g_detail)
+
+# --- S14h：数据行「实参语义顺序」——防两个同类型字段（seq/ms）互换 ---
+# S14g 只按转换符顺序填值，若 seq 与 ms 两个 %u 互换位置，转换符序列不变、
+# 渲染出的行也不变 → S14g 仍绿。所以必须单独钉住实参表达式本身。
+_h_ok, _h_detail = False, _exp_err or "没找到数据行的 snprintf"
+if _exp_data:
+    _want = [("seq", "->seq"), ("ms", "->ms"), ("ready", "ready"), ("dec", "dec"),
+             ("color", "SVPNColorName"), ("extra", "->extra"), ("ev", "SVPNEventName")]
+    _args = _exp_data[1]
+    if len(_args) != len(_want):
+        _h_detail = "实参个数 %d != %d：%s" % (len(_args), len(_want), _args)
+    else:
+        _marks = []
+        for (_fn, _needle), _a in zip(_want, _args):
+            _marks.append(_fn if _needle in _a else "!" + _fn)
+        _h_ok = all(not m.startswith("!") for m in _marks)
+        _h_detail = "逐位 %s ← %s" % (_marks, _args)
+chk("S14h C 端数据行实参的语义顺序就是 seq/ms/ready/dec/color/extra/event",
+    _h_ok, _h_detail)
+
+# --- S14i：首行——版本串 + total/kept/slots 三个关键字 ---
+#
+# ★ 首行的版本号在本工程里是**字面量**（`"# SingleVPN diag v" SVPN_VERSION_STR`），
+#   不是转换符。第一版我按「版本也是一个参数」写，把 "9.9-9" 塞进第一个 %u →
+#   int('9.9-9') 直接抛。判据自己写错方向，和源码无关。
+#   按真实形态重写后，这条其实比原设计更强：解析出来的 version 必须**就等于**
+#   源码里的 SVPN_VERSION_STR —— 顺带钉住了「版本串三处一致」的读侧。
+#   同时保留「万一有人把版本号改成 %s」的分支，两种情况都覆盖。
+_i_ok, _i_detail = False, _exp_err or "没找到首行的 snprintf（含 total=）"
+if _diag and _exp_head:
+    try:
+        import tempfile as _tf
+        _hconvs = re.findall(r"%[-+0#0-9]*([diuxs])", _exp_head[0])
+        if len(_hconvs) == 3:
+            # 真实现：v<字面量> + total/kept/slots
+            _hvals = [9, 3, 256]
+            _hver = _exp_ver
+        elif len(_hconvs) == 4 and _hconvs[0] == "s":
+            # 防御分支：版本号被改成转换符了
+            _hvals = ["9.9-9", 9, 3, 256]
+            _hver = "9.9-9"
+        else:
+            raise ValueError("首行转换符序列 %s 既不是 (total,kept,slots) 也不是 (ver,total,kept,slots)"
+                             % _hconvs)
+        # 故意让 total>kept（缓冲绕圈），kept 不会被误当 total 蒙过去
+        _hline = _sim_c_printf(_exp_head[0], _hvals).rstrip("\n")
+        _base = _diag._synth(1, [("CLEAR", "gate open", 0, 0)], ver="9.9-9").splitlines()
+        _base[0] = _hline                      # 只替换首行
+        _fd, _p = _tf.mkstemp(suffix=".txt")
+        os.close(_fd)
+        io.open(_p, "w", encoding="utf-8", newline="\n").write("\n".join(_base) + "\n")
+        try:
+            _h3, _r3 = _diag.parse(_p)
+        finally:
+            os.remove(_p)
+        _i_ok = (bool(_hver) and _h3["version"] == _hver and _h3["total"] == 9
+                 and _h3["kept"] == 3 and _h3["slots"] == 256)
+        _i_detail = "格式串 %r → %r → %s（源里版本=%r）" % (
+            _exp_head[0], _hline, _h3, _exp_ver)
+    except BaseException as _e:
+        _i_detail = "格式串 %r 模拟/解析失败：%r" % (_exp_head[0], _e)
+chk("S14i C 端首行格式串（版本 + total/kept/slots）与解析器一致",
+    _i_ok, _i_detail)
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:
