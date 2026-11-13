@@ -19,6 +19,7 @@ import ast
 import hashlib
 import lzma
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -388,7 +389,7 @@ def main():
             "_dispatch_source_create" not in low,
             "命中 %d" % low.count("_dispatch_source_create"))
 
-        # ★★ 2.2-5 诊断层真的编进产物了。
+        # ★ 2.2-5 诊断层真的编进产物了。
         #    为什么必须从产物这一侧判、而不是只判源码：
         #    诊断代码全在 @try 里、返回值没人用，是最容易被编译器当成
         #    「无效代码」整块删掉的形式。源码里写着、产物里没有，
@@ -396,9 +397,43 @@ def main():
         #    会被误判成染色逻辑的问题，白跑一整轮。
         #    静态函数名会留在 LC_SYMTAB 字符串表里（__ZL… 或 SVPN 前缀），
         #    这是编译级硬证据，比段大小可靠（段大小会随任何无关改动漂移）。
-        _diag_syms = [s for s in ("SVPNNote", "SVPNExportDiag", "SVPNColorKind",
-                                  "SVPNMaybeExport", "SVPNEventName")
-                      if s in low]
+        #
+        # ★★ 必须按**完整符号名**匹配，不能用子串 —— 这是本项目第三次
+        #    栽在同一个坑上（前两次：CI 的裸 SVPN_DIAG 误伤 SVPN_DIAG_SLOTS；
+        #    闸门的泛词 selector）。这里具体是：SVPNNote 是
+        #    SVPNNoteTransition 的前缀，2.2-4 根本没有诊断层，
+        #    却因为命中 `__ZL18SVPNNoteTransitionv` 被判成「有 SVPNNote」。
+        #    反向验证（用 2.2-4 旧包跑新闸门）时暴露出来的。
+        #
+        # ★ 解析用的不是「尾部字符是不是标识符」那种启发式 —— 它不成立：
+        #   真实符号是 Itanium 修饰名 `__ZL8SVPNNotejP7UIColorj`，
+        #   其中 `8` 是名字长度、紧跟着参数类型编码 `jP7UIColorj`。
+        #   `SVPNNote` 后面跟的 `j` 是参数编码，不是名字的一部分，
+        #   按「尾部字符」判会把正确的符号也判成前缀（两个方向都会错）。
+        #   正确做法：读长度前缀，切出**恰好那么多**字符作为名字。
+        def _cpp_static_name(sym):
+            """从 Itanium 修饰名里取出 static 局部名；不是这种形式返回 None。
+
+            `__ZL8SVPNNotejP7UIColorj`        → 'SVPNNote'
+            `__ZL18SVPNNoteTransitionv`       → 'SVPNNoteTransition'
+            `____ZL16SVPNRestoreAsyncv_block_invoke` → 'SVPNRestoreAsync'
+            """
+            m2 = re.search(r"ZL(\d+)", sym)
+            if not m2:
+                return None
+            nlen = int(m2.group(1))
+            start = m2.end()
+            return sym[start:start + nlen]
+
+        _cpp_names = set()
+        for _n in names:
+            _v = _cpp_static_name(_n)
+            if _v:
+                _cpp_names.add(_v)
+
+        _diag_want = ("SVPNNote", "SVPNExportDiag", "SVPNColorKind",
+                      "SVPNMaybeExport", "SVPNEventName")
+        _diag_syms = [t for t in _diag_want if t in _cpp_names]
         chk(f + " ★ 诊断层编进产物了（否则用户装了点导出什么都没发生）",
             len(_diag_syms) >= 4,
             "命中 %d/5: %s" % (len(_diag_syms), _diag_syms))

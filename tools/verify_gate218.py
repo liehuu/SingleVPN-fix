@@ -37,6 +37,9 @@ FILES = {
     # ★ 2.2-5：CI workflow 也进了还原清单。S13 组判的就是它的 shell 判据，
     #   注入后必须能改回来，否则下一轮 verify 步骤会莫名其妙地假红。
     "yml": os.path.join(_REPO, ".github", "workflows", "build.yml"),
+    # ★ 2.2-5 收尾：诊断解析器也进了闸门（S14 组判的是它与源码的格式契约）。
+    #   同一个规则：判据覆盖了哪个文件，就必须在还原清单里。
+    "dp": os.path.join(_REPO, "tools", "read_diag.py"),
 }
 _orig = {k: io.open(p, encoding="utf-8", newline="").read() for k, p in FILES.items()}
 
@@ -648,6 +651,61 @@ CASES = [
                 "static void ReloadPrefs(void);\n",
                 "",
                 "S13d 静态函数都是先声明/定义后使用"),
+
+    # ---------------------------------------------------------------
+    # S14 诊断解析器与源码格式契约（2.2-5 收尾新增）
+    #
+    # ★ 这一组测的是「读诊断数据的工具自己会不会读错」。它比一般判据更需要
+    #   反向验证：一份读错字段的解析器会输出**看起来很有道理的错误结论**，
+    #   然后我照着它去改染色代码 —— 那比没有工具更糟。
+    # ---------------------------------------------------------------
+    # 事件名漂移：源码改了名字而脚本没跟（最常见的真实情形）
+    one_replace("B101 源码改了事件名，解析器没跟着改（两侧对不上）",
+                'return "WifiSignal.setActiveColor:";',
+                'return "WifiSignal.setActiveColorX:";',
+                "S14b 事件名两侧完全一致"),
+
+    # 脚本多认一个源码里没有的事件名 —— 同样要红（方向相反的漂移）
+    one_replace("B102 解析器多认了一个源码没有的事件名（反向漂移）",
+                '    "gate open": LAYER_CTRL,',
+                '    "gate open": LAYER_CTRL,\n    "phantom.event:": LAYER_CTRL,',
+                "S14b 事件名两侧完全一致", file="dp"),
+
+    # 颜色名漂移：源码把 CLEAR 改名，脚本仍按旧名分类 → 透明色被当未知
+    one_replace("B103 源码改了颜色名（CLEAR → TRANSPARENT），脚本不认",
+                'case SVPNColorClear:  return "CLEAR";',
+                'case SVPNColorClear:  return "TRANSPARENT";',
+                "S14c 颜色名两侧一致"),
+
+    # 解析器字段顺序错位：这是最隐蔽的一种 —— 照样能解析出 7 个字段，
+    # 但 ready/dec 或 color/extra 互换，结论就会指向错误的层。
+    one_replace("B104 解析器把 color 与 extra 两列读反（能解析但字段错位）",
+                r'r"^(\d+)\s+(\d+)\s+([01])\s+([01])\s+(\S+)\s+(\d+)\s+(.+?)\s*$", s',
+                r'r"^(\d+)\s+(\d+)\s+([01])\s+([01])\s+(\d+)\s+(\S+)\s+(.+?)\s*$", s',
+                "S14d 导出行的字段顺序与解析器一致", file="dp"),
+
+    # 自测被架空：把「按组判」改回「按单项判」，自测必须失败（那条反向用例
+    # 就是为了咬住这个错法才写的 —— 第五例「组内只缺一项」）。
+    one_replace("B105 分层判定退回按单项判（会把『这次没变』误报成视图缺失）",
+                "if all(by_ev.get(e, 0) == 0 for e in grp)",
+                "if any(by_ev.get(e, 0) == 0 for e in grp)",
+                "S14e read_diag.py --selftest 实跑通过", file="dp"),
+
+    # 解析器整个不见了：诊断数据就没人能读。
+    # ★ 期望 S14a2 而不是 S14a：实测发现删空文件后 S14a（`is not None`）**仍然通过**
+    #   —— 空 .py 也能 import 成功，拿到的是空 module 而不是 None。
+    #   真正咬住「读不了」的是 S14a2（关键成员齐全 + 有实质内容）。
+    #   这条用例的名字保留，是因为它测的场景是「文件没了」；
+    #   但判据必须挂在真正能红的那一条上。
+    ("B106 解析器文件被清空（诊断数据从此没人能读）",
+     "dp", lambda s: "", "S14a2 解析器不是空壳"),
+
+    # ★ 同一个场景的另一种形态：文件还在、也还能 import，但内容被删到只剩
+    #   一个无关函数 —— S14a 和「文件存在」都过，只有 S14a2 的成员断言能拦住。
+    one_replace("B107 解析器被掏空成只剩一个空壳（存在但不可用）",
+                "def parse(path):",
+                "def parse_disabled(path):",
+                "S14a2 解析器不是空壳", file="dp"),
 
     # ---------------------------------------------------------------
     # S9 版本号一致性

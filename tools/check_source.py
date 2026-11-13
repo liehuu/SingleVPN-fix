@@ -1032,6 +1032,155 @@ for _fn, _def_at in _static_defs.items():
 chk("S13d 静态函数都是先声明/定义后使用（否则 CI 报 undeclared identifier）",
     not _order_viol, "违规 %s" % _order_viol)
 
+# ---------------------------------------------------------------------------
+# [S14] 诊断解析器与源码的一致性
+#
+# ★ 为什么这一组必须有：tools/read_diag.py 是「拿来下结论的工具」。它读错字段、
+#   或者事件名对不上，输出会是一份**看起来很有道理的错误结论** —— 比没有工具更
+#   危险，因为它会直接决定我改哪一版代码。所以它的格式契约必须被钉在源码上。
+#   注意这组判的是「两侧一致」，不是「脚本写得对不对」：任何一侧改动而另一侧
+#   没跟上，都要红。
+# ---------------------------------------------------------------------------
+print()
+print("[S14] 诊断解析器 read_diag.py 与源码格式契约一致")
+_DIAG_PY = os.path.join(_REPO, "tools", "read_diag.py")
+
+
+def _returns_of(fn_name, text):
+    """取某个函数里所有 return "xxx"; 的字符串值（只认双引号字面量）。
+
+    ★ 注意 body_of 的签名是 body_of(sig, txt)，不是 (txt, sig)。
+      第一版写成 body_of(text, fn_name) → 永远找不到符号 → 返回空串 →
+      S14b/S14c 双双假 FAIL。判据调辅助函数时，参数顺序错会让它**永假**，
+      和永真一样无效，而且更费时间（人会以为是源码有问题）。
+      所以两条判据都带 `bool(_src_ev_names)` 这类非空守卫 —— 那正是防我自己
+      把取数写空的兜底。
+    """
+    body = body_of(fn_name, text)
+    if not body:
+        return []
+    return re.findall(r'return\s+"([^"]*)"\s*;', body)
+
+
+_ev_name_body = body_of(ns, "SVPNEventName")
+_src_ev_names = set(_returns_of("SVPNEventName", ns))
+_src_ev_names.discard("?")
+_col_name_body = body_of(ns, "SVPNColorName")
+_src_col_names = set(_returns_of("SVPNColorName", ns))
+_src_col_names.discard("?")
+
+if os.path.exists(_DIAG_PY):
+    _diag_src = io.open(_DIAG_PY, encoding="utf-8").read()
+    _diag = {}
+    try:
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location("read_diag_for_gate", _DIAG_PY)
+        _diag = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_diag)
+    except Exception as _e:
+        _diag = None
+        _import_err = repr(_e)
+else:
+    _diag_src = ""
+    _diag = None
+    _import_err = "文件不存在"
+
+chk("S14a read_diag.py 存在且能导入（解析器没了，诊断数据就没人能读）",
+    _diag is not None, _import_err if _diag is None else str(_DIAG_PY))
+
+# ★★ S14a 的补强：上面那条在**文件为空**时是假通过。
+#    空 .py 能 import 成功，得到的是一个什么都没有的 module 对象，
+#    不是 None → `_diag is not None` 恒真。实测确认过：把文件写空，
+#    S14a 照样 OK（只有 S14b/c/d 红）。这是「存在 ≠ 可用」的典型。
+#    所以必须断言它**有实际内容**，而且关键成员都在。
+_diag_members = ("parse", "classify", "report", "_synth", "EVENT_LAYER", "CRITICAL")
+_diag_missing = [m for m in _diag_members if not hasattr(_diag, m)] if _diag else list(_diag_members)
+_diag_nbytes = len(_diag_src)
+chk("S14a2 解析器不是空壳（关键成员齐全 + 有实质内容）",
+    _diag is not None and not _diag_missing and _diag_nbytes > 4000,
+    "缺 %s / %d 字节" % (_diag_missing, _diag_nbytes))
+
+_py_ev = set(getattr(_diag, "EVENT_LAYER", {}).keys()) if _diag else set()
+_only_src = sorted(_src_ev_names - _py_ev)
+_only_py = sorted(_py_ev - _src_ev_names)
+chk("S14b 事件名两侧完全一致（源码 SVPNEventName ↔ read_diag EVENT_LAYER）",
+    bool(_src_ev_names) and not _only_src and not _only_py,
+    "源码独有 %s / 脚本独有 %s" % (_only_src, _only_py))
+
+if _diag:
+    _py_colors = set()
+    for _k in ("GOOD",):
+        _v = getattr(_diag, _k, None)
+        if isinstance(_v, str):
+            _py_colors.add(_v)
+    _b = getattr(_diag, "BAD", ())
+    if isinstance(_b, (tuple, list, set)):
+        _py_colors |= set(_b)
+else:
+    _py_colors = set()
+_only_c_src = sorted(_src_col_names - _py_colors)
+chk("S14c 颜色名两侧一致（源码 SVPNColorName 的每个返回都被脚本识别）",
+    bool(_src_col_names) and not _only_c_src,
+    "源里有而脚本不认 %s" % _only_c_src)
+
+# 字段映射用**行为**判：合成一行，喂给解析器，断言每个字段落到正确位置。
+# 只查「正则里有 7 个组」是假判据 —— 组顺序错了它照样过。
+field_ok, _field_detail = False, ""
+if _diag:
+    try:
+        import tempfile as _tf
+        _txt = _diag._synth(1, [("CLEAR", "WifiSignal.setActiveColor:", 1, 7)], ver="9.9-9")
+        _fd, _p = _tf.mkstemp(suffix=".txt")
+        os.close(_fd)
+        io.open(_p, "w", encoding="utf-8", newline="\n").write(_txt)
+        try:
+            _h, _r = _diag.parse(_p)
+        finally:
+            os.remove(_p)
+        _row = _r[0]
+        _field_ok = (
+            _h["version"] == "9.9-9" and _h["total"] == 1 and _h["kept"] == 1
+            and _row["seq"] == 1 and _row["ready"] == 1 and _row["dec"] == 1
+            and _row["color"] == "CLEAR" and _row["extra"] == 7
+            and _row["ev"] == "WifiSignal.setActiveColor:"
+        )
+        _field_detail = "解析结果 %s" % dict(_row)
+    except BaseException as _e:
+        # ★★ 必须用 BaseException，不能只捕 Exception。
+        #    read_diag.parse() 在格式不符时 raise SystemExit —— 而 **SystemExit
+        #    不是 Exception 的子类**。第一版写 except Exception 的结果是：
+        #    B104 注入让正则错位 → parse 抛 SystemExit → 没人接 → 整个
+        #    check_source.py 在打印「失败：」之前就退出了。
+        #    于是闸门确实返回非 0，但反向验证拿不到失败列表、断言不到
+        #    「是哪条判据拦下的」—— 这正是「红了 ≠ 红对了」的教科书案例。
+        _field_ok = False
+        _field_detail = "解析抛了 %r" % _e
+chk("S14d 导出行的字段顺序与解析器一致（行为级：合成一行逐字段比对）",
+    _field_ok, _field_detail)
+
+# 自测必须真跑：这是唯一能证明「四种世界分得开」的判据。
+_sel_ok, _sel_detail = False, "未跑"
+if _diag:
+    try:
+        import subprocess as _sp
+        _pr = _sp.run([sys.executable, _DIAG_PY, "--selftest"],
+                      capture_output=True, text=True, timeout=90)
+        _out = (_pr.stdout or "")
+        _tail = _out.strip().splitlines()
+        _detail_line = _tail[-1] if _tail else (_pr.stderr or "")[-200:]
+        # ★★ 只看退出码是假判据：解析器被写空时，`--selftest` 什么也不做，
+        #    进程照样以 0 退出 → 判「通过」。实测确认过（写空文件后 S14e 仍 OK）。
+        #    所以还要断言它**真的跑了用例**：输出里必须出现「自测全过」且用例数
+        #    不少于 6（当前 8 例；留余量，但空跑一定是 0）。
+        _n_ok = len(re.findall(r"^\s+OK\s+\S", _out, re.M))
+        _sel_ok = (_pr.returncode == 0 and "自测全过" in _out and _n_ok >= 6)
+        _sel_detail = "%s（退出码 %d，实测用例 %d 条）" % (
+            _detail_line, _pr.returncode, _n_ok)
+    except Exception as _e:
+        _sel_detail = "跑了但抛 %r" % _e
+chk("S14e read_diag.py --selftest 实跑通过（分层判定真的分得开，坏文件真被拒绝）",
+    _sel_ok, _sel_detail)
+
 print()
 print("通过 %d 项，失败 %d 项" % (len(oks), len(fails)))
 if fails:
